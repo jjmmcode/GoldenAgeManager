@@ -94,6 +94,26 @@ INITIAL_ACCESS_SYNC_DONE = False
 ACCESS_SYNC_IN_PROGRESS = set()
 
 # ------------------------------------------------------------
+# RACE COUNT SYSTEM
+# ------------------------------------------------------------
+
+RACE_COUNT_CHANNEL_ID = 1543938120301551626
+
+# Counts are based on Accepted Character Applications, not raw race roles.
+# This prevents self-assigned / legacy race roles from consuming slots.
+RACE_COUNT_LIMITS = {
+    "Saiyan": ("Saiyan", 10),
+    "Human": ("Human", 10),
+    "Android": ("Human (Android)", 2),
+    "Namekian": ("Namekian", 10),
+    "Frost-Demon": ("Arcosian", 10),
+    "Bio-Android": ("Bio-Android", 10),
+    "Majin": ("Majin", 10),
+}
+
+RACE_COUNT_LOCK = asyncio.Lock()
+
+# ------------------------------------------------------------
 # ONBOARDING REPORT SYSTEM
 # ------------------------------------------------------------
 
@@ -167,7 +187,8 @@ STATE_FILE = os.path.join(
 def load_processed_applications():
     default_state = {
         "mentor": {},
-        "character": {}
+        "character": {},
+        "meta": {}
     }
 
     if not os.path.exists(STATE_FILE):
@@ -186,6 +207,7 @@ def load_processed_applications():
 
         data.setdefault("mentor", {})
         data.setdefault("character", {})
+        data.setdefault("meta", {})
 
         return data
 
@@ -652,6 +674,149 @@ async def rebuild_approved_character_cache():
         f"🎮 Approved character cache rebuilt: "
         f"{len(APPROVED_CHARACTER_CACHE)} player(s)."
     )
+
+
+def get_race_counts():
+    """Returns current approved-player counts by application race tag."""
+
+    counts = {
+        race_tag: 0
+        for race_tag in RACE_COUNT_LIMITS
+    }
+
+    for race_tag_name in APPROVED_CHARACTER_CACHE.values():
+        if race_tag_name in counts:
+            counts[race_tag_name] += 1
+
+    return counts
+
+
+def build_race_count_message():
+    """Builds the public Race Count message using accepted applications."""
+
+    counts = get_race_counts()
+    lines = [
+        "## Race Count",
+        "",
+    ]
+
+    for race_tag, (display_name, limit) in RACE_COUNT_LIMITS.items():
+        count = counts.get(race_tag, 0)
+
+        if count > limit:
+            status = " <- OVER CAP"
+        elif count >= limit:
+            status = " <- FULL"
+        elif count >= max(1, int(limit * 0.8)):
+            status = " <- LIMITED"
+        else:
+            status = ""
+
+        lines.append(
+            f"**{display_name}:** {count}/{limit}{status}"
+        )
+
+    lines.extend([
+        "",
+        "-# Automatically updated by Golden Age Manager.",
+        "-# Counts use Accepted Character Applications only.",
+    ])
+
+    return "\n".join(lines)
+
+
+async def get_race_count_message(channel: discord.TextChannel):
+    """Finds the bot-owned managed Race Count message, if one exists."""
+
+    meta = PROCESSED_APPLICATIONS.setdefault("meta", {})
+    stored_message_id = meta.get("race_count_message_id")
+
+    if stored_message_id:
+        try:
+            message = await channel.fetch_message(
+                int(stored_message_id)
+            )
+
+            if message.author.id == client.user.id:
+                return message
+
+        except (
+            discord.NotFound,
+            discord.Forbidden,
+            discord.HTTPException,
+            ValueError,
+            TypeError,
+        ):
+            pass
+
+    try:
+        async for message in channel.history(limit=100):
+            if (
+                message.author.id == client.user.id
+                and "## Race Count" in (message.content or "")
+                and "Automatically updated by Golden Age Manager"
+                in (message.content or "")
+            ):
+                meta["race_count_message_id"] = message.id
+                save_processed_applications()
+                return message
+
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+
+    return None
+
+
+async def update_race_count_message(reason: str = "automatic update"):
+    """Creates or edits Golden Age Manager's managed Race Count message."""
+
+    async with RACE_COUNT_LOCK:
+        channel = await get_channel(RACE_COUNT_CHANNEL_ID)
+
+        if not isinstance(channel, discord.TextChannel):
+            print(
+                "⚠️ Race Count channel was not found or is not a text channel."
+            )
+            return False
+
+        content = build_race_count_message()
+        message = await get_race_count_message(channel)
+
+        try:
+            if message is None:
+                message = await channel.send(content)
+                PROCESSED_APPLICATIONS.setdefault(
+                    "meta", {}
+                )["race_count_message_id"] = message.id
+                save_processed_applications()
+
+                print(
+                    f"📊 Race Count message created in #{channel.name}."
+                )
+            elif message.content != content:
+                await message.edit(content=content)
+                print(
+                    f"📊 Race Count updated ({reason})."
+                )
+            else:
+                print(
+                    f"📊 Race Count already current ({reason})."
+                )
+
+            return True
+
+        except discord.Forbidden:
+            print(
+                "❌ Golden Age Manager cannot create/edit the Race Count. "
+                "Check View Channel, Send Messages and Read Message History."
+            )
+            return False
+
+        except discord.HTTPException as error:
+            print(
+                f"❌ Discord API error while updating Race Count: {error}"
+            )
+            return False
 
 
 async def sync_all_community_access():
@@ -2294,6 +2459,7 @@ async def on_ready():
 
     if not INITIAL_ACCESS_SYNC_DONE:
         await rebuild_approved_character_cache()
+        await update_race_count_message(reason="startup")
         await sync_all_community_access()
         INITIAL_ACCESS_SYNC_DONE = True
         print()
@@ -2918,6 +3084,21 @@ async def handle_character_application(
         after_tags - before_tags
     )
 
+    accepted_normalized = normalize(
+        CHARACTER_ACCEPTED_TAG
+    )
+
+    accepted_removed = (
+        accepted_normalized in before_tags
+        and accepted_normalized not in after_tags
+    )
+
+    if accepted_removed:
+        await rebuild_approved_character_cache()
+        await update_race_count_message(
+            reason="Accepted tag removed"
+        )
+
     if not newly_added:
         return
 
@@ -2935,16 +3116,17 @@ async def handle_character_application(
             "Character Application"
         )
 
+        await rebuild_approved_character_cache()
+        await update_race_count_message(
+            reason="character rejected"
+        )
+
         return
 
 
     # --------------------------------------------------------
     # ACCEPTED
     # --------------------------------------------------------
-
-    accepted_normalized = normalize(
-        CHARACTER_ACCEPTED_TAG
-    )
 
     if accepted_normalized not in newly_added:
         return
@@ -3368,6 +3550,11 @@ async def handle_character_application(
             "character",
             after.id,
             approved_thread.id
+        )
+
+
+        await update_race_count_message(
+            reason=f"approved {display_name}"
         )
 
 
