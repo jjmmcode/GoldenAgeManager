@@ -57,10 +57,32 @@ APPROVED_CHARACTERS_FORUM_ID = 1543909774062518333
 
 CHARACTER_ACCEPTED_TAG = "Accepted"
 CHARACTER_REJECTED_TAG = "Rejected"
-# Optional moderated forum tag. If present on an Accepted application, the
-# character is included in Mutant Count even if the legacy application text
-# has no explicit Mutant field.
-CHARACTER_MUTANT_TAG = "Mutant"
+
+
+# ------------------------------------------------------------
+# MUTANT SYSTEM
+# ------------------------------------------------------------
+
+MUTANT_APPLICATION_FORUM_ID = 1544184281474142258
+APPROVED_MUTANTS_FORUM_ID = 1544184521862291516
+
+MUTANT_ACCEPTED_TAG = "Accepted"
+MUTANT_REJECTED_TAG = "Rejected"
+MUTANT_PENDING_TAG = "Pending"
+MUTANT_MIGRATION_TAG = "Migration"
+MUTANT_NEW_APPLICATION_TAG = "New Application"
+
+# approved-mutants uses public/lore race labels. Android mutants are grouped
+# with Human because the current Mutant Count does not have an Android row.
+MUTANT_APPROVED_TAG_BY_CHARACTER_RACE = {
+    "Saiyan": "Saiyan",
+    "Human": "Human",
+    "Android": "Human",
+    "Namekian": "Namekian",
+    "Frost-Demon": "Arcosian",
+    "Bio-Android": "Bio-Android",
+    "Majin": "Majin",
+}
 
 
 # ------------------------------------------------------------
@@ -138,6 +160,10 @@ MUTANT_COUNT_RACES = {
     "Bio-Android": "Bio-Android",
     "Majin": "Majin",
 }
+
+# Every Mutant category has a hard cap of 3 approved characters.
+# Android Mutants are grouped under Human, matching MUTANT_COUNT_RACES.
+MUTANT_LIMIT_PER_RACE = 3
 
 RACE_COUNT_LOCK = asyncio.Lock()
 
@@ -266,6 +292,7 @@ def load_processed_applications():
     default_state = {
         "mentor": {},
         "character": {},
+        "mutant": {},
         "meta": {}
     }
 
@@ -285,6 +312,7 @@ def load_processed_applications():
 
         data.setdefault("mentor", {})
         data.setdefault("character", {})
+        data.setdefault("mutant", {})
         data.setdefault("meta", {})
 
         return data
@@ -753,8 +781,6 @@ async def rebuild_approved_character_cache():
 
     APPROVED_CHARACTER_CACHE.clear()
     APPROVED_CHARACTER_RECORDS.clear()
-    APPROVED_MUTANT_CACHE.clear()
-    APPROVED_MUTANT_RECORDS.clear()
 
     forum = await get_channel(
         CHARACTER_APPLICATION_FORUM_ID
@@ -865,27 +891,6 @@ async def rebuild_approved_character_cache():
             "thread_name": thread.name,
         }
 
-        is_mutant = (
-            normalize(CHARACTER_MUTANT_TAG) in tag_names
-            or detect_mutant_status(
-                starter_message.content or "",
-                application
-            )
-        )
-
-        if is_mutant:
-            mutant_record = {
-                "user_id": user_id,
-                "race": race_tag_name,
-                "name": mutant_display_name(
-                    application,
-                    starter_message.author
-                ),
-            }
-
-            APPROVED_MUTANT_CACHE[user_id] = mutant_record
-            APPROVED_MUTANT_RECORDS[thread.id] = mutant_record
-
     print(
         f"🎮 Approved character access cache rebuilt: "
         f"{len(APPROVED_CHARACTER_CACHE)} unique player(s)."
@@ -903,11 +908,6 @@ async def rebuild_approved_character_cache():
             f"{accepted_threads_skipped}. See warnings above."
         )
 
-    print(
-        f"🧬 Approved mutants counted: "
-        f"{len(APPROVED_MUTANT_RECORDS)} mutant character(s)."
-    )
-
     # Per-race diagnostics make population mismatches easy to spot in Kinetic.
     diagnostic_counts = {}
     for record in APPROVED_CHARACTER_RECORDS.values():
@@ -922,6 +922,379 @@ async def rebuild_approved_character_cache():
         print(f"📊 Accepted race breakdown: {diagnostic_text}")
 
     await audit_approved_character_registry()
+
+
+async def collect_forum_threads(forum: discord.ForumChannel):
+    """Returns active + archived forum threads without duplicates."""
+
+    threads = []
+    seen_ids = set()
+
+    for thread in forum.threads:
+        if thread.id not in seen_ids:
+            threads.append(thread)
+            seen_ids.add(thread.id)
+
+    try:
+        async for thread in forum.archived_threads(limit=None):
+            if thread.id not in seen_ids:
+                threads.append(thread)
+                seen_ids.add(thread.id)
+    except (discord.Forbidden, discord.HTTPException) as error:
+        print(
+            f"⚠️ Could not read every archived thread in "
+            f"#{forum.name}: {error}"
+        )
+
+    return threads
+
+
+def parse_mutant_application(content: str):
+    """Parses the dedicated Mutant Application template."""
+
+    aliases = {
+        "discord_username": [
+            r"discord\s*username",
+            r"discord",
+        ],
+        "character_name": [
+            r"character\s*name",
+            r"birth\s*name",
+            r"character",
+        ],
+        "character_application": [
+            r"character\s*application(?:\s*link)?",
+            r"approved\s*character\s*application",
+            r"character\s*app",
+        ],
+        "application_type": [
+            r"application\s*type",
+            r"type",
+        ],
+        "race": [
+            r"race\s*/\s*species",
+            r"species\s*/\s*race",
+            r"race",
+            r"species",
+        ],
+        "mutation_name": [
+            r"mutation\s*name\s*/\s*type",
+            r"mutation\s*name",
+            r"mutation\s*type",
+            r"mutant\s*type",
+        ],
+        "origin": [
+            r"origin\s*of\s*the\s*mutation",
+            r"mutation\s*origin",
+            r"origin",
+        ],
+        "physical_changes": [
+            r"physical\s*changes",
+            r"physical\s*effects",
+        ],
+        "abilities": [
+            r"abilities\s*/\s*advantages",
+            r"advantages\s*/\s*abilities",
+            r"abilities",
+            r"advantages",
+        ],
+        "weaknesses": [
+            r"weaknesses\s*/\s*limitations",
+            r"limitations\s*/\s*weaknesses",
+            r"weaknesses",
+            r"limitations",
+            r"drawbacks",
+        ],
+        "mutation_backstory": [
+            r"mutation\s*backstory",
+            r"mutation\s*lore",
+            r"backstory",
+        ],
+        "character_effect": [
+            r"how\s*does\s*the\s*mutation\s*affect\s*your\s*character\??",
+            r"effect\s*on\s*character",
+            r"character\s*impact",
+        ],
+        "previously_approved": [
+            r"were\s*you\s*already\s*an\s*approved\s*mutant\s*on\s*the\s*previous\s*server\??",
+            r"previously\s*approved\s*mutant",
+        ],
+        "previous_character_name": [
+            r"previous\s*character\s*name",
+        ],
+        "previous_mutant_race": [
+            r"previous\s*mutant\s*race",
+        ],
+        "proof": [
+            r"proof\s*/\s*evidence",
+            r"evidence\s*/\s*proof",
+            r"proof",
+            r"evidence",
+        ],
+        "additional_info": [
+            r"additional\s*information",
+            r"additional\s*info",
+            r"anything\s*else",
+        ],
+    }
+
+    return parse_labeled_fields(content, aliases)
+
+
+def extract_discord_thread_id(value: str | None):
+    """Extracts the channel/thread ID from a Discord message/thread URL."""
+
+    if not value:
+        return None
+
+    # https://discord.com/channels/GUILD_ID/THREAD_ID/MESSAGE_ID
+    match = re.search(
+        r"(?:discord(?:app)?\.com/channels/|discord\.com/channels/)"
+        r"\d+/(\d+)(?:/\d+)?",
+        value,
+        re.IGNORECASE,
+    )
+    if match:
+        return int(match.group(1))
+
+    # If the dedicated field contains only an ID, accept it as a fallback.
+    match = re.fullmatch(r"\s*(\d{17,20})\s*", value)
+    if match:
+        return int(match.group(1))
+
+    return None
+
+
+def mutant_count_race(character_race: str | None):
+    """Maps a Character race to the current Mutant Count categories."""
+
+    if character_race == "Android":
+        return "Human"
+
+    if character_race in MUTANT_COUNT_RACES:
+        return character_race
+
+    return None
+
+
+async def get_character_application_record(thread: discord.Thread):
+    """Validates and parses one Accepted Character Application thread."""
+
+    if not isinstance(thread, discord.Thread):
+        return None, "The linked Character Application is not a forum thread."
+
+    if thread.parent_id != CHARACTER_APPLICATION_FORUM_ID:
+        return None, "The link does not point to #character-application."
+
+    tag_names = {normalize(tag.name) for tag in thread.applied_tags}
+
+    if normalize(CHARACTER_ACCEPTED_TAG) not in tag_names:
+        return None, "The linked Character Application is not currently Accepted."
+
+    if normalize(CHARACTER_REJECTED_TAG) in tag_names:
+        return None, "The linked Character Application is Rejected."
+
+    starter = await get_starter_message(thread)
+    if starter is None:
+        return None, "The linked Character Application could not be read."
+
+    application = parse_character_application(starter.content or "")
+    race = detect_race_tag(application.get("race"))
+
+    if race is None:
+        return None, "The linked Character Application has an unreadable race."
+
+    return {
+        "thread": thread,
+        "starter": starter,
+        "application": application,
+        "race": race,
+        "name": (
+            application.get("character_name")
+            or thread.name
+            or starter.author.display_name
+        ),
+    }, None
+
+
+async def resolve_character_application_for_mutant(
+    mutant_author_id: int,
+    mutant_application: dict,
+):
+    """
+    Resolves the approved Character Application tied to a Mutant Application.
+
+    Priority:
+      1. Explicit Character Application link/ID in the Mutant form.
+      2. Accepted applications by the same Discord author.
+      3. If multiple exist, match Character Name.
+    """
+
+    explicit_value = mutant_application.get("character_application")
+    explicit_thread_id = extract_discord_thread_id(explicit_value)
+
+    if explicit_thread_id:
+        channel = await get_channel(explicit_thread_id)
+
+        if not isinstance(channel, discord.Thread):
+            return None, "The Character Application link could not be resolved."
+
+        record, error = await get_character_application_record(channel)
+        if error:
+            return None, error
+
+        if record["starter"].author.id != mutant_author_id:
+            return None, (
+                "The linked Character Application belongs to a different "
+                "Discord user."
+            )
+
+        return record, None
+
+    forum = await get_channel(CHARACTER_APPLICATION_FORUM_ID)
+    if not isinstance(forum, discord.ForumChannel):
+        return None, "#character-application could not be accessed."
+
+    matches = []
+    for thread in await collect_forum_threads(forum):
+        record, error = await get_character_application_record(thread)
+        if error or record is None:
+            continue
+
+        if record["starter"].author.id == mutant_author_id:
+            matches.append(record)
+
+    if not matches:
+        return None, (
+            "No Accepted Character Application belonging to this applicant "
+            "could be found."
+        )
+
+    if len(matches) == 1:
+        return matches[0], None
+
+    wanted_name = normalize(mutant_application.get("character_name") or "")
+    if wanted_name:
+        name_matches = [
+            record for record in matches
+            if normalize(record.get("name") or "") == wanted_name
+            or wanted_name in normalize(record.get("name") or "")
+            or normalize(record.get("name") or "") in wanted_name
+        ]
+
+        if len(name_matches) == 1:
+            return name_matches[0], None
+
+    return None, (
+        "Multiple Accepted Character Applications were found for this user. "
+        "Please paste the exact Character Application link in the Mutant form."
+    )
+
+
+async def rebuild_approved_mutant_cache():
+    """
+    Rebuilds Mutant Count exclusively from Accepted Mutant Applications.
+
+    Character Applications no longer grant Mutant status by themselves.
+    """
+
+    APPROVED_MUTANT_CACHE.clear()
+    APPROVED_MUTANT_RECORDS.clear()
+
+    forum = await get_channel(MUTANT_APPLICATION_FORUM_ID)
+
+    if not isinstance(forum, discord.ForumChannel):
+        print(
+            "⚠️ Could not rebuild approved mutant cache: "
+            "mutant-application forum not found."
+        )
+        return
+
+    accepted_name = normalize(MUTANT_ACCEPTED_TAG)
+    rejected_name = normalize(MUTANT_REJECTED_TAG)
+    accepted_seen = 0
+    skipped = 0
+
+    for thread in await collect_forum_threads(forum):
+        tag_names = {normalize(tag.name) for tag in thread.applied_tags}
+
+        if accepted_name not in tag_names or rejected_name in tag_names:
+            continue
+
+        accepted_seen += 1
+
+        starter = await get_starter_message(thread)
+        if starter is None:
+            skipped += 1
+            print(
+                f"⚠️ Accepted mutant skipped: '{thread.name}' has no "
+                "readable starter message."
+            )
+            continue
+
+        mutant_application = parse_mutant_application(starter.content or "")
+        character_record, error = await resolve_character_application_for_mutant(
+            starter.author.id,
+            mutant_application,
+        )
+
+        if error or character_record is None:
+            skipped += 1
+            print(
+                f"⚠️ Accepted mutant skipped: '{thread.name}' — {error}"
+            )
+            continue
+
+        race = mutant_count_race(character_record["race"])
+        if race is None:
+            skipped += 1
+            print(
+                f"⚠️ Accepted mutant skipped: '{thread.name}' — "
+                f"race {character_record['race']!r} has no Mutant Count row."
+            )
+            continue
+
+        name = (
+            clean_value(mutant_application.get("character_name") or "")
+            or clean_value(character_record.get("name") or "")
+            or thread.name
+        )
+        name = re.sub(r"[*_`~]", "", name).splitlines()[0].strip()[:40]
+
+        record = {
+            "user_id": starter.author.id,
+            "race": race,
+            "character_race": character_record["race"],
+            "name": name,
+            "source_thread_id": thread.id,
+            "character_thread_id": character_record["thread"].id,
+        }
+
+        APPROVED_MUTANT_CACHE[starter.author.id] = record
+        APPROVED_MUTANT_RECORDS[thread.id] = record
+
+    print(
+        f"🧬 Approved Mutant Applications counted: "
+        f"{len(APPROVED_MUTANT_RECORDS)} mutant character(s) "
+        f"from {accepted_seen} Accepted thread(s)."
+    )
+
+    if skipped:
+        print(
+            f"⚠️ Accepted Mutant Applications skipped: {skipped}. "
+            "See warnings above."
+        )
+
+    breakdown = {}
+    for record in APPROVED_MUTANT_RECORDS.values():
+        breakdown[record["race"]] = breakdown.get(record["race"], 0) + 1
+
+    if breakdown:
+        diagnostic = ", ".join(
+            f"{MUTANT_COUNT_RACES.get(race, race)}: {count}"
+            for race, count in sorted(breakdown.items())
+        )
+        print(f"🧬 Accepted mutant breakdown: {diagnostic}")
 
 
 async def audit_approved_character_registry():
@@ -1088,21 +1461,32 @@ def build_race_count_message():
     for race_tag, display_name in MUTANT_COUNT_RACES.items():
         names = mutant_counts.get(race_tag, [])
         count = len(names)
+        limit = MUTANT_LIMIT_PER_RACE
+
+        if count > limit:
+            status = " <- OVER CAP"
+        elif count >= limit:
+            status = " <- FULL"
+        elif count >= 2:
+            status = " <- LIMITED"
+        else:
+            status = ""
 
         if names:
             lines.append(
-                f"**{display_name}:** {count} ({', '.join(names)})"
+                f"**{display_name}:** {count}/{limit}{status} "
+                f"({', '.join(names)})"
             )
         else:
             lines.append(
-                f"**{display_name}:** 0"
+                f"**{display_name}:** 0/{limit}"
             )
 
     lines.extend([
         "",
         "-# Automatically updated by Golden Age Manager.",
         "-# Race Count uses Accepted Character Applications only.",
-        "-# Mutants are detected from the moderated Mutant forum tag, an explicit Mutant/Mutation field, or a Race/Species value containing 'Mutant'.",
+        "-# Mutant Count uses Accepted Mutant Applications only (max 3 per race).",
     ])
 
     return "\n".join(lines)
@@ -3008,6 +3392,12 @@ async def on_ready():
 
         "approved-characters":
             APPROVED_CHARACTERS_FORUM_ID,
+
+        "mutant-application":
+            MUTANT_APPLICATION_FORUM_ID,
+
+        "approved-mutants":
+            APPROVED_MUTANTS_FORUM_ID,
     }
 
     for (
@@ -3048,6 +3438,7 @@ async def on_ready():
 
     if not INITIAL_ACCESS_SYNC_DONE:
         await rebuild_approved_character_cache()
+        await rebuild_approved_mutant_cache()
         await update_race_count_message(reason="startup")
         await sync_all_community_access()
         INITIAL_ACCESS_SYNC_DONE = True
@@ -3257,6 +3648,19 @@ async def on_thread_update(
     ):
 
         await handle_character_application(
+            before,
+            after
+        )
+
+        return
+
+
+    if (
+        after.parent_id
+        == MUTANT_APPLICATION_FORUM_ID
+    ):
+
+        await handle_mutant_application(
             before,
             after
         )
@@ -3682,32 +4086,10 @@ async def handle_character_application(
         and accepted_normalized not in after_tags
     )
 
-    mutant_normalized = normalize(
-        CHARACTER_MUTANT_TAG
-    )
-
-    mutant_changed = (
-        (mutant_normalized in before_tags)
-        != (mutant_normalized in after_tags)
-    )
-
     if accepted_removed:
         await rebuild_approved_character_cache()
         await update_race_count_message(
             reason="Accepted tag removed"
-        )
-
-    # Mutant can be a separate moderated forum tag. Staff may add/remove it
-    # after a character was already accepted, so refresh the public count
-    # immediately without forcing Accepted to be toggled again.
-    if (
-        mutant_changed
-        and accepted_normalized in after_tags
-        and accepted_normalized not in newly_added
-    ):
-        await rebuild_approved_character_cache()
-        await update_race_count_message(
-            reason="Mutant tag changed"
         )
 
     if not newly_added:
@@ -4300,6 +4682,394 @@ async def handle_character_application(
         )
 
         print()
+
+
+# ============================================================
+# MUTANT AUTOMATION
+# ============================================================
+
+async def handle_mutant_application(
+    before: discord.Thread,
+    after: discord.Thread,
+):
+    """Processes the dedicated Mutant Application forum."""
+
+    before_tags = {normalize(tag.name) for tag in before.applied_tags}
+    after_tags = {normalize(tag.name) for tag in after.applied_tags}
+    newly_added = after_tags - before_tags
+
+    accepted_name = normalize(MUTANT_ACCEPTED_TAG)
+    rejected_name = normalize(MUTANT_REJECTED_TAG)
+
+    accepted_removed = (
+        accepted_name in before_tags
+        and accepted_name not in after_tags
+    )
+
+    if accepted_removed:
+        await rebuild_approved_mutant_cache()
+        await update_race_count_message(
+            reason="Mutant Accepted tag removed"
+        )
+
+    if not newly_added:
+        return
+
+    if rejected_name in newly_added:
+        await reject_application(
+            after,
+            "Mutant Application"
+        )
+        await rebuild_approved_mutant_cache()
+        await update_race_count_message(
+            reason="mutant application rejected"
+        )
+        return
+
+    if accepted_name not in newly_added:
+        return
+
+    # --------------------------------------------------------
+    # MUTANT CAPACITY GUARD
+    # --------------------------------------------------------
+    # Rebuild after the Accepted tag is added so the candidate is included
+    # in the source-of-truth count. If this approval would make the race
+    # exceed 3/3, Golden Age Manager removes Accepted and leaves the
+    # application open for Staff to resolve.
+    await rebuild_approved_mutant_cache()
+
+    candidate_record = APPROVED_MUTANT_RECORDS.get(after.id)
+
+    if candidate_record is not None:
+        candidate_race = candidate_record.get("race")
+        same_race_records = [
+            record
+            for record in APPROVED_MUTANT_RECORDS.values()
+            if record.get("race") == candidate_race
+        ]
+        candidate_count = len(same_race_records)
+
+        if candidate_count > MUTANT_LIMIT_PER_RACE:
+            display_race = MUTANT_COUNT_RACES.get(
+                candidate_race,
+                candidate_race or "Unknown",
+            )
+
+            try:
+                remaining_tags = [
+                    tag
+                    for tag in after.applied_tags
+                    if normalize(tag.name) != accepted_name
+                ]
+
+                await after.edit(
+                    applied_tags=remaining_tags,
+                    reason=(
+                        "Golden Age Manager: Mutant race capacity reached"
+                    ),
+                )
+
+                await after.send(
+                    "## 🚫 Mutant Capacity Reached\n\n"
+                    f"**{display_race} Mutants are currently full:** "
+                    f"`{MUTANT_LIMIT_PER_RACE}/{MUTANT_LIMIT_PER_RACE}`.\n\n"
+                    "This application cannot be approved until a slot "
+                    "becomes available. Golden Age Manager removed the "
+                    "`Accepted` tag automatically.\n\n"
+                    "The application has **not** been published or archived."
+                )
+
+            except discord.Forbidden:
+                print(
+                    "❌ Could not remove Accepted after Mutant capacity "
+                    "was exceeded. Check Manage Threads/forum permissions."
+                )
+
+            except discord.HTTPException as error:
+                print(
+                    f"❌ Discord API error while enforcing Mutant cap: {error}"
+                )
+
+            await rebuild_approved_mutant_cache()
+            await update_race_count_message(
+                reason="Mutant approval blocked by race capacity"
+            )
+
+            print(
+                f"🚫 Mutant approval blocked: {display_race} is "
+                f"{MUTANT_LIMIT_PER_RACE}/{MUTANT_LIMIT_PER_RACE} FULL."
+            )
+            return
+
+    # --------------------------------------------------------
+    # DUPLICATE / SELF-HEAL PROTECTION
+    # --------------------------------------------------------
+
+    if application_was_processed("mutant", after.id):
+        destination_exists = await processed_destination_exists(
+            "mutant",
+            after.id,
+            APPROVED_MUTANTS_FORUM_ID,
+        )
+
+        if destination_exists:
+            await rebuild_approved_mutant_cache()
+            await update_race_count_message(
+                reason="Mutant Accepted tag restored on processed application"
+            )
+
+            print(
+                "⚠️ This mutant application was already processed. "
+                "Profile duplicate skipped; Mutant Count refreshed."
+            )
+            return
+
+        unmark_application_processed("mutant", after.id)
+        print(
+            "♻️ Processed mutant profile is missing from approved-mutants. "
+            "Rebuilding it now..."
+        )
+
+    print()
+    print("=" * 65)
+    print("🧬 MUTANT APPROVAL DETECTED")
+    print(f"📋 {after.name}")
+    print("=" * 65)
+
+    approved_forum = await get_channel(APPROVED_MUTANTS_FORUM_ID)
+    if not isinstance(approved_forum, discord.ForumChannel):
+        print("❌ approved-mutants not found.")
+        return
+
+    starter_message = await get_starter_message(after)
+    if starter_message is None:
+        print("❌ Mutant starter message not found.")
+        return
+
+    mutant_application = parse_mutant_application(
+        starter_message.content or ""
+    )
+
+    character_record, error = await resolve_character_application_for_mutant(
+        starter_message.author.id,
+        mutant_application,
+    )
+
+    if error or character_record is None:
+        print(f"❌ Mutant approval blocked: {error}")
+
+        try:
+            await after.send(
+                "⚠️ **Golden Age Manager could not validate this Mutant "
+                "Application.**\n\n"
+                f"{error}\n\n"
+                "Please make sure the applicant has an **Accepted Character "
+                "Application** and that the Mutant form contains its exact "
+                "Discord link in `Character Application:`.\n\n"
+                "The application was **not published or archived**."
+            )
+        except discord.HTTPException:
+            pass
+
+        return
+
+    character_race = character_record["race"]
+    destination_tag_name = MUTANT_APPROVED_TAG_BY_CHARACTER_RACE.get(
+        character_race
+    )
+
+    if destination_tag_name is None:
+        print(
+            f"❌ Mutant race {character_race!r} has no approved-mutants tag mapping."
+        )
+        return
+
+    destination_tag = find_forum_tag(
+        approved_forum,
+        destination_tag_name,
+    )
+
+    if destination_tag is None:
+        print(
+            f"❌ Destination mutant tag '{destination_tag_name}' "
+            "does not exist in approved-mutants."
+        )
+        return
+
+    character_name = (
+        clean_value(mutant_application.get("character_name") or "")
+        or clean_value(character_record.get("name") or "")
+        or after.name
+    )
+    character_name = re.sub(r"[*_`~]", "", character_name)
+    character_name = character_name.splitlines()[0].strip()
+
+    normalized_after_tags = {normalize(tag.name) for tag in after.applied_tags}
+
+    if normalize(MUTANT_MIGRATION_TAG) in normalized_after_tags:
+        application_type = "Migration"
+    elif normalize(MUTANT_NEW_APPLICATION_TAG) in normalized_after_tags:
+        application_type = "New Application"
+    else:
+        application_type = clean_value(
+            mutant_application.get("application_type") or ""
+        ) or "Unspecified"
+
+    embed = discord.Embed(
+        title="✅ Approved Mutant"
+    )
+
+    embed.set_author(
+        name=starter_message.author.display_name,
+        icon_url=starter_message.author.display_avatar.url,
+    )
+
+    embed.description = (
+        f"## {character_name}\n"
+        f"**{destination_tag_name} Mutant**"
+    )
+
+    embed.add_field(
+        name="🧬 Race",
+        value=destination_tag_name,
+        inline=True,
+    )
+
+    embed.add_field(
+        name="📦 Application Type",
+        value=application_type[:1024],
+        inline=True,
+    )
+
+    fields = [
+        ("🧬 Mutation Name / Type", "mutation_name"),
+        ("🌌 Origin of the Mutation", "origin"),
+        ("👁️ Physical Changes", "physical_changes"),
+        ("⚡ Abilities / Advantages", "abilities"),
+        ("⚠️ Weaknesses / Limitations", "weaknesses"),
+        ("📖 Mutation Backstory", "mutation_backstory"),
+        ("🎭 Effect on Character", "character_effect"),
+    ]
+
+    for label, key in fields:
+        value = mutant_application.get(key)
+        if value:
+            add_long_field(embed, label, value)
+
+    if application_type.casefold() == "migration":
+        migration_lines = []
+        if mutant_application.get("previously_approved"):
+            migration_lines.append(
+                f"**Previously Approved:** {mutant_application['previously_approved']}"
+            )
+        if mutant_application.get("previous_character_name"):
+            migration_lines.append(
+                f"**Previous Character Name:** {mutant_application['previous_character_name']}"
+            )
+        if mutant_application.get("previous_mutant_race"):
+            migration_lines.append(
+                f"**Previous Mutant Race:** {mutant_application['previous_mutant_race']}"
+            )
+
+        if migration_lines:
+            add_long_field(
+                embed,
+                "📦 Migration Information",
+                "\n".join(migration_lines),
+            )
+
+    proof = mutant_application.get("proof")
+    if proof:
+        add_long_field(embed, "🧾 Proof / Evidence", proof)
+
+    additional_info = mutant_application.get("additional_info")
+    if additional_info:
+        add_long_field(embed, "➕ Additional Information", additional_info)
+
+    embed.add_field(
+        name="🔗 Character Application",
+        value=(
+            f"[View approved character application]"
+            f"({character_record['starter'].jump_url})"
+        ),
+        inline=False,
+    )
+
+    embed.add_field(
+        name="🔗 Mutant Application",
+        value=(
+            f"[View original mutant application]"
+            f"({starter_message.jump_url})"
+        ),
+        inline=False,
+    )
+
+    embed.set_footer(
+        text="Dragon Ball: Golden Age • Mutant Registry"
+    )
+
+    files, thumbnail_filename = await prepare_attachments(starter_message)
+    if thumbnail_filename:
+        embed.set_thumbnail(
+            url=f"attachment://{thumbnail_filename}"
+        )
+
+    try:
+        result = await approved_forum.create_thread(
+            name=character_name[:100],
+            embed=embed,
+            applied_tags=[destination_tag],
+            files=files,
+        )
+
+        approved_thread = result.thread
+
+        mark_application_processed(
+            "mutant",
+            after.id,
+            approved_thread.id,
+        )
+
+        print(
+            f"✅ Approved mutant profile created: {approved_thread.name}"
+        )
+
+        await after.send(
+            "## ✅ Mutant Application Approved\n\n"
+            "Your Mutant Application has been accepted.\n\n"
+            f"🧬 **Character:** `{character_name}`\n"
+            f"🌌 **Mutant Race:** `{destination_tag_name}`\n"
+            f"📦 **Type:** `{application_type}`\n\n"
+            "Your Mutant profile has been published in "
+            f"{approved_forum.mention}."
+        )
+
+        await after.edit(
+            archived=True,
+            locked=True,
+            reason="Golden Age Manager: Mutant approved",
+        )
+
+        await rebuild_approved_mutant_cache()
+        await update_race_count_message(
+            reason="mutant application approved"
+        )
+
+        print("🔒 Original mutant application archived.")
+        print("✅ Mutant automation completed successfully.")
+        print()
+
+    except discord.Forbidden:
+        print(
+            "❌ MUTANT PERMISSION ERROR — Golden Age Manager does not "
+            "have enough permissions in the Mutant forums."
+        )
+
+    except discord.HTTPException as error:
+        print(f"❌ MUTANT DISCORD API ERROR: {error}")
+
+    except Exception as error:
+        print(f"❌ MUTANT UNEXPECTED ERROR: {repr(error)}")
 
 
 # ============================================================
