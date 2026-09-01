@@ -287,6 +287,84 @@ def mark_application_processed(
     save_processed_applications()
 
 
+def unmark_application_processed(
+    application_type: str,
+    source_thread_id: int
+):
+    """Remove a stale processed marker so an application can be rebuilt."""
+
+    applications = PROCESSED_APPLICATIONS.get(
+        application_type,
+        {}
+    )
+
+    removed = applications.pop(
+        str(source_thread_id),
+        None
+    )
+
+    if removed is not None:
+        save_processed_applications()
+
+    return removed
+
+
+async def processed_destination_exists(
+    application_type: str,
+    source_thread_id: int,
+    expected_parent_id: int | None = None
+) -> bool:
+    """
+    Checks whether the destination thread recorded in
+    processed_applications.json still exists.
+
+    This lets the bot self-heal when an approved profile was manually
+    deleted and the source application is later accepted again.
+    """
+
+    record = PROCESSED_APPLICATIONS.get(
+        application_type,
+        {}
+    ).get(str(source_thread_id))
+
+    if not isinstance(record, dict):
+        return False
+
+    destination_thread_id = record.get(
+        "destination_thread_id"
+    )
+
+    if not destination_thread_id:
+        return False
+
+    channel = client.get_channel(
+        int(destination_thread_id)
+    )
+
+    if channel is None:
+        try:
+            channel = await client.fetch_channel(
+                int(destination_thread_id)
+            )
+        except (
+            discord.NotFound,
+            discord.Forbidden,
+            discord.HTTPException
+        ):
+            return False
+
+    if not isinstance(channel, discord.Thread):
+        return False
+
+    if (
+        expected_parent_id is not None
+        and channel.parent_id != expected_parent_id
+    ):
+        return False
+
+    return True
+
+
 # ============================================================
 # DISCORD CLIENT
 # ============================================================
@@ -3141,22 +3219,42 @@ async def handle_character_application(
         after.id
     ):
 
-        # The profile was already published previously, so do not
-        # create a duplicate approved-character thread. However, the
-        # Accepted tag may have just been restored after a test or
-        # staff correction. Rebuild the cache and refresh Race Count
-        # before returning.
-        await rebuild_approved_character_cache()
-        await update_race_count_message(
-            reason="Accepted tag restored on processed application"
+        destination_exists = await processed_destination_exists(
+            "character",
+            after.id,
+            APPROVED_CHARACTERS_FORUM_ID
+        )
+
+        if destination_exists:
+            # The approved profile still exists, so do not duplicate it.
+            # The Accepted tag may simply have been restored after a test
+            # or staff correction.
+            await rebuild_approved_character_cache()
+            await update_race_count_message(
+                reason="Accepted tag restored on processed application"
+            )
+
+            print(
+                "⚠️ This character application was already processed. "
+                "Profile duplicate skipped; Race Count refreshed."
+            )
+
+            return
+
+        # The source application is marked as processed, but its approved
+        # profile no longer exists (for example, Staff manually deleted it
+        # from approved-characters during a test). Clear the stale marker
+        # and continue through the normal approval flow so the profile is
+        # recreated automatically.
+        unmark_application_processed(
+            "character",
+            after.id
         )
 
         print(
-            "⚠️ This character application was already processed. "
-            "Profile duplicate skipped; Race Count refreshed."
+            "♻️ Processed character profile is missing from "
+            "approved-characters. Rebuilding it now..."
         )
-
-        return
 
 
     print()
