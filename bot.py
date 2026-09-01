@@ -51,6 +51,37 @@ CHARACTER_ACCEPTED_TAG = "Accepted"
 CHARACTER_REJECTED_TAG = "Rejected"
 
 
+# ------------------------------------------------------------
+# ACCESS / ROLE SYSTEM
+# ------------------------------------------------------------
+
+# Member + Verified => Community Access
+COMMUNITY_ACCESS_ROLE_ID = 1544132019993190510
+APPROVED_PLAYER_ROLE_ID = 1544132204370726982
+
+MEMBER_ROLE_ID = 1543940669939261481
+VERIFIED_ROLE_ID = 1543980307290791976
+
+# Discord role assigned after a character is approved.
+# Human and Android intentionally share the same Discord role.
+CHARACTER_RACE_ROLE_IDS = {
+    "Saiyan": 1543926682774147113,
+    "Frost-Demon": 1543929886132011100,
+    "Namekian": 1543929975692992513,
+    "Human": 1543930046681448560,
+    "Android": 1543930046681448560,
+    "Majin": 1543930112037232730,
+    "Bio-Android": 1543930297257693326,
+}
+
+# Cache built from Accepted character applications.
+# user_id -> approved race tag (for example: "Saiyan")
+APPROVED_CHARACTER_CACHE = {}
+
+# Prevents the initial backfill from running more than once per process.
+INITIAL_ACCESS_SYNC_DONE = False
+
+
 # Lo que puede escribir el usuario -> tag real
 RACE_MAPPING = {
     # Saiyans
@@ -213,6 +244,10 @@ def mark_application_processed(
 intents = discord.Intents.default()
 intents.message_content = True
 
+# Required to react to role changes and synchronize Community Access.
+# This also requires SERVER MEMBERS INTENT in the Discord Developer Portal.
+intents.members = True
+
 client = discord.Client(
     intents=intents
 )
@@ -333,6 +368,489 @@ async def get_starter_message(
         pass
 
     return None
+
+
+async def get_guild_member(
+    guild: discord.Guild,
+    user_id: int
+):
+    """Gets a guild member from cache, falling back to the API."""
+
+    member = guild.get_member(user_id)
+
+    if member is not None:
+        return member
+
+    try:
+        return await guild.fetch_member(user_id)
+
+    except (
+        discord.NotFound,
+        discord.Forbidden,
+        discord.HTTPException
+    ):
+        return None
+
+
+def get_access_roles(guild: discord.Guild):
+    """Returns the three roles used by the Community Access gate."""
+
+    return (
+        guild.get_role(MEMBER_ROLE_ID),
+        guild.get_role(VERIFIED_ROLE_ID),
+        guild.get_role(COMMUNITY_ACCESS_ROLE_ID),
+    )
+
+
+async def sync_community_access_for_member(
+    member: discord.Member,
+    *,
+    reason: str = "Golden Age Manager: access synchronization"
+):
+    """
+    Community Access exists only while the member has BOTH
+    Member and Verified.
+
+    Approved Player is also temporarily removed if the member loses
+    either prerequisite. If the member becomes eligible again and has
+    an Accepted character application, it is restored automatically.
+    """
+
+    if member.bot:
+        return False
+
+    member_role, verified_role, community_role = get_access_roles(
+        member.guild
+    )
+
+    if not all((member_role, verified_role, community_role)):
+        print(
+            "⚠️ Community Access sync skipped: one or more "
+            "configured roles do not exist in this guild."
+        )
+        return False
+
+    role_ids = {
+        role.id
+        for role in member.roles
+    }
+
+    should_have_access = (
+        MEMBER_ROLE_ID in role_ids
+        and VERIFIED_ROLE_ID in role_ids
+    )
+
+    has_access = COMMUNITY_ACCESS_ROLE_ID in role_ids
+    changed = False
+
+    try:
+        if should_have_access and not has_access:
+            await member.add_roles(
+                community_role,
+                reason=reason
+            )
+
+            print(
+                f"🎟️ Community Access granted to "
+                f"{member} ({member.id})."
+            )
+            changed = True
+
+        elif not should_have_access and has_access:
+            await member.remove_roles(
+                community_role,
+                reason=reason
+            )
+
+            print(
+                f"🔒 Community Access removed from "
+                f"{member} ({member.id})."
+            )
+            changed = True
+
+        approved_player_role = member.guild.get_role(
+            APPROVED_PLAYER_ROLE_ID
+        )
+
+        if approved_player_role is not None:
+            has_approved_player = (
+                approved_player_role in member.roles
+            )
+
+            # No Member + Verified means no Minecraft/IP access.
+            if not should_have_access and has_approved_player:
+                await member.remove_roles(
+                    approved_player_role,
+                    reason=(
+                        "Golden Age Manager: access prerequisites lost"
+                    )
+                )
+
+                print(
+                    f"🔒 Approved Player temporarily removed from "
+                    f"{member} because Member + Verified is incomplete."
+                )
+                changed = True
+
+            # Restore Approved Player automatically for accepted characters.
+            elif should_have_access:
+                approved_race = APPROVED_CHARACTER_CACHE.get(
+                    member.id
+                )
+
+                if approved_race:
+                    ok, result = await grant_character_access_roles(
+                        member,
+                        approved_race
+                    )
+
+                    if not ok:
+                        print(
+                            f"⚠️ Could not restore character access for "
+                            f"{member}: {result}"
+                        )
+
+    except discord.Forbidden:
+        print(
+            f"❌ Could not update access roles for {member}. "
+            "Check Manage Roles and role hierarchy."
+        )
+
+    except discord.HTTPException as error:
+        print(
+            f"❌ Discord API error while synchronizing "
+            f"access for {member}: {error}"
+        )
+
+    return changed
+
+
+async def rebuild_approved_character_cache():
+    """
+    Scans Accepted character applications, including archived forum posts,
+    so existing approved players can be restored after a bot restart.
+    """
+
+    APPROVED_CHARACTER_CACHE.clear()
+
+    forum = await get_channel(
+        CHARACTER_APPLICATION_FORUM_ID
+    )
+
+    if not isinstance(forum, discord.ForumChannel):
+        print(
+            "⚠️ Could not rebuild approved character cache: "
+            "character-application forum not found."
+        )
+        return
+
+    threads = []
+    seen_thread_ids = set()
+
+    for thread in forum.threads:
+        if thread.id not in seen_thread_ids:
+            threads.append(thread)
+            seen_thread_ids.add(thread.id)
+
+    try:
+        async for thread in forum.archived_threads(limit=None):
+            if thread.id not in seen_thread_ids:
+                threads.append(thread)
+                seen_thread_ids.add(thread.id)
+
+    except (discord.Forbidden, discord.HTTPException) as error:
+        print(
+            f"⚠️ Could not read every archived character application: "
+            f"{error}"
+        )
+
+    accepted_name = normalize(
+        CHARACTER_ACCEPTED_TAG
+    )
+
+    rejected_name = normalize(
+        CHARACTER_REJECTED_TAG
+    )
+
+    for thread in threads:
+        tag_names = {
+            normalize(tag.name)
+            for tag in thread.applied_tags
+        }
+
+        if accepted_name not in tag_names:
+            continue
+
+        if rejected_name in tag_names:
+            continue
+
+        starter_message = await get_starter_message(
+            thread
+        )
+
+        if starter_message is None:
+            continue
+
+        application = parse_character_application(
+            starter_message.content or ""
+        )
+
+        race_tag_name = detect_race_tag(
+            application.get("race")
+        )
+
+        if race_tag_name is None:
+            continue
+
+        APPROVED_CHARACTER_CACHE[
+            starter_message.author.id
+        ] = race_tag_name
+
+    print(
+        f"🎮 Approved character cache rebuilt: "
+        f"{len(APPROVED_CHARACTER_CACHE)} player(s)."
+    )
+
+
+async def sync_all_community_access():
+    """Backfills Community Access for members already in the server."""
+
+    print("🎟️ Synchronizing Community Access...")
+
+    changed = 0
+
+    for guild in client.guilds:
+        member_role, verified_role, community_role = get_access_roles(
+            guild
+        )
+
+        # Only operate in a guild that contains our configured roles.
+        if not all((member_role, verified_role, community_role)):
+            continue
+
+        for member in guild.members:
+            if await sync_community_access_for_member(
+                member,
+                reason=(
+                    "Golden Age Manager: initial Community Access sync"
+                )
+            ):
+                changed += 1
+
+    print(
+        f"✅ Community Access synchronization complete. "
+        f"Changes: {changed}"
+    )
+
+
+def resolve_character_access_roles(
+    guild: discord.Guild,
+    race_tag_name: str
+):
+    """Resolves and validates Approved Player + detected race role."""
+
+    approved_player_role = guild.get_role(
+        APPROVED_PLAYER_ROLE_ID
+    )
+
+    race_role_id = CHARACTER_RACE_ROLE_IDS.get(
+        race_tag_name
+    )
+
+    race_role = (
+        guild.get_role(race_role_id)
+        if race_role_id
+        else None
+    )
+
+    if approved_player_role is None:
+        return None, None, "Approved Player role was not found."
+
+    if race_role_id is None:
+        return (
+            None,
+            None,
+            f"No Discord race role is configured for '{race_tag_name}'."
+        )
+
+    if race_role is None:
+        return (
+            None,
+            None,
+            f"Discord race role {race_role_id} was not found."
+        )
+
+    bot_member = guild.me
+
+    if bot_member is None:
+        return None, None, "Could not resolve the bot member in this guild."
+
+    if not bot_member.guild_permissions.manage_roles:
+        return None, None, "Golden Age Manager lacks Manage Roles."
+
+    for target_role in (approved_player_role, race_role):
+        if target_role >= bot_member.top_role:
+            return (
+                None,
+                None,
+                f"Role '{target_role.name}' is not below Golden Age "
+                "Manager in the role hierarchy."
+            )
+
+    return approved_player_role, race_role, None
+
+
+async def grant_character_access_roles(
+    member: discord.Member,
+    race_tag_name: str
+):
+    """
+    Grants Approved Player plus the Discord role matching the approved race.
+    Existing race roles are not removed in this phase.
+    """
+
+    approved_player_role, race_role, error = (
+        resolve_character_access_roles(
+            member.guild,
+            race_tag_name
+        )
+    )
+
+    if error:
+        return False, error
+
+    member_role_ids = {
+        role.id
+        for role in member.roles
+    }
+
+    if not (
+        MEMBER_ROLE_ID in member_role_ids
+        and VERIFIED_ROLE_ID in member_role_ids
+    ):
+        return (
+            False,
+            "Member + Verified are required before Approved Player "
+            "can be granted."
+        )
+
+    roles_to_add = []
+
+    if approved_player_role not in member.roles:
+        roles_to_add.append(approved_player_role)
+
+    if race_role not in member.roles:
+        roles_to_add.append(race_role)
+
+    if not roles_to_add:
+        return (
+            True,
+            f"Already has {approved_player_role.name} and {race_role.name}."
+        )
+
+    try:
+        await member.add_roles(
+            *roles_to_add,
+            reason=(
+                "Golden Age Manager: character application approved"
+            )
+        )
+
+        print(
+            f"🎮 Character access granted to {member}: "
+            f"{approved_player_role.name} + {race_role.name}"
+        )
+
+        return (
+            True,
+            f"{approved_player_role.name} + {race_role.name}"
+        )
+
+    except discord.Forbidden:
+        return (
+            False,
+            "Discord denied role assignment. Check Manage Roles and "
+            "the role hierarchy."
+        )
+
+    except discord.HTTPException as error:
+        return False, f"Discord API error while assigning roles: {error}"
+
+
+async def sync_processed_character_access():
+    """
+    Retries role delivery for character applications that this bot has
+    previously recorded in processed_applications.json.
+    """
+
+    processed_characters = PROCESSED_APPLICATIONS.get(
+        "character",
+        {}
+    )
+
+    if not processed_characters:
+        return
+
+    print("🎮 Synchronizing processed character access...")
+
+    successful = 0
+
+    for source_thread_id, record in processed_characters.items():
+        if record.get("status", "approved") != "approved":
+            continue
+
+        try:
+            source_thread = await get_channel(
+                int(source_thread_id)
+            )
+
+            if not isinstance(source_thread, discord.Thread):
+                continue
+
+            starter_message = await get_starter_message(
+                source_thread
+            )
+
+            if starter_message is None:
+                continue
+
+            application = parse_character_application(
+                starter_message.content or ""
+            )
+
+            race_tag_name = detect_race_tag(
+                application.get("race")
+            )
+
+            if race_tag_name is None:
+                continue
+
+            member = await get_guild_member(
+                source_thread.guild,
+                starter_message.author.id
+            )
+
+            if member is None:
+                continue
+
+            ok, _ = await grant_character_access_roles(
+                member,
+                race_tag_name
+            )
+
+            if ok:
+                successful += 1
+
+        except Exception as error:
+            print(
+                f"⚠️ Could not backfill character application "
+                f"{source_thread_id}: {error!r}"
+            )
+
+    print(
+        f"✅ Processed character access sync complete. "
+        f"Checked/granted: {successful}"
+    )
 
 
 def is_image_attachment(
@@ -872,14 +1390,62 @@ async def on_ready():
 
         print()
 
+    global INITIAL_ACCESS_SYNC_DONE
+
+    if not INITIAL_ACCESS_SYNC_DONE:
+        await rebuild_approved_character_cache()
+        await sync_all_community_access()
+        INITIAL_ACCESS_SYNC_DONE = True
+        print()
+
     print("=" * 65)
 
     print(
-        "🤖 Waiting for applications..."
+        "🤖 Waiting for applications and role changes..."
     )
 
     print("=" * 65)
     print()
+
+
+# ============================================================
+# MEMBER / ACCESS AUTOMATION
+# ============================================================
+
+@client.event
+async def on_member_update(
+    before: discord.Member,
+    after: discord.Member
+):
+    """Keeps Community Access aligned with Member + Verified."""
+
+    watched_role_ids = {
+        MEMBER_ROLE_ID,
+        VERIFIED_ROLE_ID,
+        COMMUNITY_ACCESS_ROLE_ID,
+    }
+
+    before_ids = {
+        role.id
+        for role in before.roles
+        if role.id in watched_role_ids
+    }
+
+    after_ids = {
+        role.id
+        for role in after.roles
+        if role.id in watched_role_ids
+    }
+
+    if before_ids == after_ids:
+        return
+
+    await sync_community_access_for_member(
+        after,
+        reason=(
+            "Golden Age Manager: Member + Verified access gate"
+        )
+    )
 
 
 # ============================================================
@@ -1424,6 +1990,30 @@ async def handle_character_application(
     author = starter_message.author
 
 
+    member = await get_guild_member(
+        after.guild,
+        author.id
+    )
+
+    if member is None:
+
+        print(
+            f"❌ Could not resolve applicant as a guild member: "
+            f"{author} ({author.id})"
+        )
+
+        try:
+            await after.send(
+                "⚠️ **Golden Age Manager could not resolve the "
+                "applicant as a server member.**\n\n"
+                "The application was not processed."
+            )
+        except discord.HTTPException:
+            pass
+
+        return
+
+
     content = (
         starter_message.content
         or ""
@@ -1539,6 +2129,33 @@ async def handle_character_application(
         f"🧬 Race detected: "
         f"{race} -> {race_tag_name}"
     )
+
+
+    _, _, access_role_error = resolve_character_access_roles(
+        after.guild,
+        race_tag_name
+    )
+
+    if access_role_error:
+
+        print(
+            f"❌ Character access role validation failed: "
+            f"{access_role_error}"
+        )
+
+        try:
+            await after.send(
+                "⚠️ **Character approval is ready, but Golden Age "
+                "Manager cannot assign the required Discord roles.**\n\n"
+                f"`{access_role_error}`\n\n"
+                "The application was **not published or archived**. "
+                "Please fix the bot role permissions/hierarchy and "
+                "apply the Accepted tag again."
+            )
+        except discord.HTTPException:
+            pass
+
+        return
 
 
     # --------------------------------------------------------
@@ -1709,6 +2326,19 @@ async def handle_character_application(
         )
 
 
+        APPROVED_CHARACTER_CACHE[
+            member.id
+        ] = race_tag_name
+
+
+        access_ok, access_result = (
+            await grant_character_access_roles(
+                member,
+                race_tag_name
+            )
+        )
+
+
         mark_application_processed(
             "character",
             after.id,
@@ -1722,12 +2352,25 @@ async def handle_character_application(
         )
 
 
+        if access_ok:
+            access_line = (
+                f"🎮 **Server Access:** Granted (`{access_result}`)"
+            )
+        else:
+            access_line = (
+                "⚠️ **Server Access:** Could not be assigned "
+                f"automatically (`{access_result}`). Staff has been "
+                "notified."
+            )
+
+
         await after.send(
             "## ✅ Character Approved\n\n"
             "Your character application has "
             "been accepted.\n\n"
             f"🧬 **Race:** "
             f"`{race_tag_name}`\n\n"
+            f"{access_line}\n\n"
             "Your character profile has been "
             f"published in "
             f"{approved_forum.mention}."
