@@ -2958,11 +2958,18 @@ def parse_mentor_application(
 
         "skill": [
             r"skill\s*i\s*want\s*to\s*mentor",
+            r"ability\s*to\s*mentor",
+            r"mentor\s*ability",
             r"mentor\s*skill",
             r"skill",
         ],
 
         "reason": [
+            # These aliases also act as boundaries so a compact field such as
+            # "Ability to Mentor: Kaioken Ability Description: ..." does not
+            # swallow the entire rest of the application into the skill name.
+            r"ability\s*description",
+            r"in[-\s]*character\s*justification(?:\s*&\s*alignment)?",
             r"why\s*do\s*i\s*want\s*to\s*be\s*the\s*mentor\s*of\s*this\s*skill\??",
             r"lore\s*reason\s*for\s*mentorship",
             r"reason\s*for\s*mentorship",
@@ -3062,6 +3069,7 @@ async def rebuild_approved_mentor_records():
 
         APPROVED_MENTOR_RECORDS[thread.id] = {
             "user_id": starter_message.author.id,
+            "author_name": starter_message.author.display_name,
             "character": character,
             "skill": skill,
             "type": mentorship_type,
@@ -3092,55 +3100,107 @@ async def rebuild_approved_mentor_records():
         print(f"🎓 Mentor breakdown: {diagnostic_text}")
 
 
+def _clean_mentor_skill_name(skill: str, thread_name: str) -> str:
+    """Return a short, human-friendly skill/form/passive name."""
+
+    value = str(skill or "").strip()
+
+    # A legacy parser could previously capture a large chunk of an
+    # application. If that happens, prefer the approved thread title.
+    if (
+        not value
+        or len(value) > 120
+        or "\n" in value
+        or "ability description" in normalize(value)
+        or "migration accepted" in normalize(value)
+    ):
+        value = str(thread_name or "Unknown Skill").strip()
+
+    # Clean common legacy approved-thread titles so the public directory reads
+    # as a simple list of what each mentor can actually teach.
+    cleanups = [
+        (r"^mentor\s+of\s+the\s+", ""),
+        (r"^mentor\s+for\s+", ""),
+        (r"\s+mentor$", ""),
+        (r"\s+and\s+dojo\s+master(?:\s*\|.*)?$", ""),
+        (r"\s*\|\s*[^|]+$", ""),
+    ]
+
+    for pattern, repl in cleanups:
+        value = re.sub(pattern, repl, value, flags=re.IGNORECASE).strip()
+
+    return value or "Unknown Skill"
+
+
+def _clean_mentor_character_name(character: str, author_name: str) -> str:
+    """Keep mentor names compact even for older application formats."""
+
+    value = str(character or "").strip()
+
+    if (
+        not value
+        or len(value) > 80
+        or "\n" in value
+        or "migration" in normalize(value)
+        or "ability to mentor" in normalize(value)
+    ):
+        value = str(author_name or "Unknown Mentor").strip()
+
+    return value or "Unknown Mentor"
+
+
 def build_mentor_list_message():
-    """Build a compact public list of all currently approved mentors."""
+    """Build a very compact list: one mentor, followed by what they teach."""
 
-    display = {
-        "Technique": ("🎯", "Technique Mentors"),
-        "Custom-Form": ("🧬", "Custom Form Mentors"),
-        "Passive-Skill": ("✨", "Passive Skill Mentors"),
-    }
-
-    grouped = {key: [] for key in display}
+    mentors = {}
 
     for record in APPROVED_MENTOR_RECORDS.values():
-        mentor_type = record.get("type")
-        if mentor_type not in grouped:
-            continue
+        character = _clean_mentor_character_name(
+            record.get("character"),
+            record.get("author_name"),
+        )
+        skill = _clean_mentor_skill_name(
+            record.get("skill"),
+            record.get("thread_name"),
+        )
 
-        character = str(record.get("character") or "Unknown Mentor").strip()
-        skill = str(record.get("skill") or record.get("thread_name") or "Unknown Skill").strip()
-        grouped[mentor_type].append((character, skill))
+        key = character.casefold()
+        entry = mentors.setdefault(
+            key,
+            {"character": character, "skills": []},
+        )
 
-    for entries in grouped.values():
-        entries.sort(key=lambda item: (item[0].casefold(), item[1].casefold()))
+        if skill.casefold() not in {item.casefold() for item in entry["skills"]}:
+            entry["skills"].append(skill)
+
+    ordered = sorted(
+        mentors.values(),
+        key=lambda item: item["character"].casefold(),
+    )
 
     lines = [
         "## 🎓 Mentor List",
         "",
     ]
 
-    for mentor_type, (emoji, heading) in display.items():
-        lines.append(f"### {emoji} {heading}")
-        entries = grouped[mentor_type]
-
-        if entries:
-            for character, skill in entries:
-                lines.append(f"• **{character}** — {skill}")
-        else:
-            lines.append("• None")
-
-        lines.append("")
+    if not ordered:
+        lines.append("• No approved mentors yet.")
+    else:
+        for entry in ordered:
+            skills = ", ".join(
+                sorted(entry["skills"], key=str.casefold)
+            )
+            lines.append(
+                f"• **{entry['character']}** — {skills}"
+            )
 
     lines.extend([
+        "",
         "-# Automatically updated by Golden Age Manager.",
-        "-# Only currently approved Mentor Applications are listed.",
     ])
 
     content = "\n".join(lines)
 
-    # Discord messages are limited to 2,000 characters. Keep the directory
-    # usable even if the mentorship program becomes much larger.
     if len(content) > 1990:
         content = content[:1900].rstrip() + (
             "\n\n-# Mentor List truncated because it exceeded Discord's message limit."
