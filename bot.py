@@ -522,6 +522,23 @@ def normalize(text: str) -> str:
     return text.strip()
 
 
+def normalize_forum_tag(text: str) -> str:
+    """
+    Normalize Discord forum tag names while ignoring decorative emoji
+    prefixes/suffixes such as "✅ Accepted" or "📦 Migration".
+    """
+
+    value = normalize(text)
+
+    if not value:
+        return ""
+
+    value = re.sub(r"^[^a-z0-9]+", "", value)
+    value = re.sub(r"[^a-z0-9]+$", "", value)
+
+    return value.strip()
+
+
 def clean_value(text: str) -> str:
 
     if not text:
@@ -543,11 +560,11 @@ def find_forum_tag(
     tag_name: str
 ):
 
-    wanted = normalize(tag_name)
+    wanted = normalize_forum_tag(tag_name)
 
     for tag in forum.available_tags:
 
-        if normalize(tag.name) == wanted:
+        if normalize_forum_tag(tag.name) == wanted:
             return tag
 
     return None
@@ -1219,13 +1236,13 @@ async def rebuild_approved_mutant_cache():
         )
         return
 
-    accepted_name = normalize(MUTANT_ACCEPTED_TAG)
-    rejected_name = normalize(MUTANT_REJECTED_TAG)
+    accepted_name = normalize_forum_tag(MUTANT_ACCEPTED_TAG)
+    rejected_name = normalize_forum_tag(MUTANT_REJECTED_TAG)
     accepted_seen = 0
     skipped = 0
 
     for thread in await collect_forum_threads(forum):
-        tag_names = {normalize(tag.name) for tag in thread.applied_tags}
+        tag_names = {normalize_forum_tag(tag.name) for tag in thread.applied_tags}
 
         if accepted_name not in tag_names or rejected_name in tag_names:
             continue
@@ -1304,6 +1321,58 @@ async def rebuild_approved_mutant_cache():
             for race, count in sorted(breakdown.items())
         )
         print(f"🧬 Accepted mutant breakdown: {diagnostic}")
+
+
+async def reconcile_accepted_mutant_applications():
+    """
+    Self-heals already-Accepted Mutant Applications at startup.
+
+    This is especially useful after changing tag formats (for example, from
+    "Accepted" to "✅ Accepted"). Accepted applications that are missing
+    their approved-mutants profile are reprocessed automatically.
+    """
+
+    forum = await get_channel(MUTANT_APPLICATION_FORUM_ID)
+
+    if not isinstance(forum, discord.ForumChannel):
+        return
+
+    accepted_name = normalize_forum_tag(MUTANT_ACCEPTED_TAG)
+    rejected_name = normalize_forum_tag(MUTANT_REJECTED_TAG)
+    repaired = 0
+
+    class _BeforeState:
+        applied_tags = []
+
+    for thread in await collect_forum_threads(forum):
+        tag_names = {normalize_forum_tag(tag.name) for tag in thread.applied_tags}
+
+        if accepted_name not in tag_names or rejected_name in tag_names:
+            continue
+
+        if application_was_processed("mutant", thread.id):
+            destination_exists = await processed_destination_exists(
+                "mutant",
+                thread.id,
+                APPROVED_MUTANTS_FORUM_ID,
+            )
+
+            if destination_exists:
+                continue
+
+        print(
+            f"♻️ Reprocessing Accepted Mutant Application at startup: "
+            f"{thread.name}"
+        )
+
+        await handle_mutant_application(_BeforeState(), thread)
+        repaired += 1
+
+    if repaired:
+        print(
+            f"🧬 Mutant startup reconciliation processed "
+            f"{repaired} Accepted application(s)."
+        )
 
 
 async def audit_approved_character_registry():
@@ -3760,6 +3829,8 @@ async def on_ready():
         await update_mentor_list_message(reason="startup")
         await rebuild_approved_character_cache()
         await rebuild_approved_mutant_cache()
+        await reconcile_accepted_mutant_applications()
+        await rebuild_approved_mutant_cache()
         await update_race_count_message(reason="startup")
         await sync_all_community_access()
         INITIAL_ACCESS_SYNC_DONE = True
@@ -5076,12 +5147,12 @@ async def handle_mutant_application(
 ):
     """Processes the dedicated Mutant Application forum."""
 
-    before_tags = {normalize(tag.name) for tag in before.applied_tags}
-    after_tags = {normalize(tag.name) for tag in after.applied_tags}
+    before_tags = {normalize_forum_tag(tag.name) for tag in before.applied_tags}
+    after_tags = {normalize_forum_tag(tag.name) for tag in after.applied_tags}
     newly_added = after_tags - before_tags
 
-    accepted_name = normalize(MUTANT_ACCEPTED_TAG)
-    rejected_name = normalize(MUTANT_REJECTED_TAG)
+    accepted_name = normalize_forum_tag(MUTANT_ACCEPTED_TAG)
+    rejected_name = normalize_forum_tag(MUTANT_REJECTED_TAG)
 
     accepted_removed = (
         accepted_name in before_tags
@@ -5141,7 +5212,7 @@ async def handle_mutant_application(
                 remaining_tags = [
                     tag
                     for tag in after.applied_tags
-                    if normalize(tag.name) != accepted_name
+                    if normalize_forum_tag(tag.name) != accepted_name
                 ]
 
                 await after.edit(
@@ -5286,11 +5357,11 @@ async def handle_mutant_application(
     character_name = re.sub(r"[*_`~]", "", character_name)
     character_name = character_name.splitlines()[0].strip()
 
-    normalized_after_tags = {normalize(tag.name) for tag in after.applied_tags}
+    normalized_after_tags = {normalize_forum_tag(tag.name) for tag in after.applied_tags}
 
-    if normalize(MUTANT_MIGRATION_TAG) in normalized_after_tags:
+    if normalize_forum_tag(MUTANT_MIGRATION_TAG) in normalized_after_tags:
         application_type = "Migration"
-    elif normalize(MUTANT_NEW_APPLICATION_TAG) in normalized_after_tags:
+    elif normalize_forum_tag(MUTANT_NEW_APPLICATION_TAG) in normalized_after_tags:
         application_type = "New Application"
     else:
         application_type = clean_value(
