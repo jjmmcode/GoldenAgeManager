@@ -1012,6 +1012,84 @@ async def get_complete_member_list(guild: discord.Guild):
         return list(guild.members)
 
 
+def get_onboarding_anomalies(row):
+    """Returns audit flags for onboarding states that deserve review."""
+
+    anomalies = []
+
+    if (
+        row["Accepted Application"] == "Yes"
+        and row["Approved Player"] == "No"
+    ):
+        anomalies.append("Accepted + no Approved Player")
+
+    if (
+        row["Accepted Application"] == "Yes"
+        and row["Verified"] == "No"
+    ):
+        anomalies.append("Accepted + not Verified")
+
+    if (
+        row["Race Role(s)"]
+        and row["Character Application"] == "No"
+    ):
+        anomalies.append("Race role + no Character Application")
+
+    if (
+        row["Character Application"] == "Yes"
+        and row["Latest Application Status"] == "No Status"
+    ):
+        anomalies.append("Application + No Status")
+
+    if (
+        row["Approved Player"] == "Yes"
+        and row["Accepted Application"] == "No"
+    ):
+        anomalies.append("Approved Player + no Accepted Application")
+
+    if (
+        row["Community Access"] == "Yes"
+        and (
+            row["Member Role"] == "No"
+            or row["Verified"] == "No"
+        )
+    ):
+        anomalies.append("Community Access without prerequisites")
+
+    if (
+        row["Approved Player"] == "Yes"
+        and row["Community Access"] == "No"
+    ):
+        anomalies.append("Approved Player without Community Access")
+
+    return anomalies
+
+
+def get_anomaly_severity(anomalies):
+    """Returns the highest severity among a member's anomaly flags."""
+
+    if not anomalies:
+        return "Clean"
+
+    critical_flags = {
+        "Approved Player + no Accepted Application",
+        "Community Access without prerequisites",
+        "Approved Player without Community Access",
+    }
+
+    high_flags = {
+        "Accepted + no Approved Player",
+    }
+
+    if any(flag in critical_flags for flag in anomalies):
+        return "Critical"
+
+    if any(flag in high_flags for flag in anomalies):
+        return "High"
+
+    return "Review"
+
+
 def build_onboarding_rows(
     guild: discord.Guild,
     members,
@@ -1128,7 +1206,7 @@ def build_onboarding_rows(
                 ZoneInfo(REPORT_TIMEZONE)
             ).strftime("%Y-%m-%d %H:%M:%S")
 
-        rows.append({
+        row = {
             "Discord Username": str(member),
             "Display Name": member.display_name,
             "User ID": str(member.id),
@@ -1158,7 +1236,15 @@ def build_onboarding_rows(
                 if (not is_verified and not has_application)
                 else "No"
             ),
-        })
+        }
+
+        anomalies = get_onboarding_anomalies(row)
+
+        row["Anomaly Count"] = len(anomalies)
+        row["Anomaly Severity"] = get_anomaly_severity(anomalies)
+        row["Anomaly Type(s)"] = "; ".join(anomalies)
+
+        rows.append(row)
 
     rows.sort(
         key=lambda item: (
@@ -1346,6 +1432,14 @@ def create_onboarding_excel(
         row["Approved Player"] == "Yes"
         for row in rows
     )
+    anomaly_member_count = sum(
+        row.get("Anomaly Count", 0) > 0
+        for row in rows
+    )
+    anomaly_flag_count = sum(
+        row.get("Anomaly Count", 0)
+        for row in rows
+    )
 
     summary.merge_cells("A1:D1")
     summary["A1"] = "Dragon Ball: Golden Age — Onboarding Report"
@@ -1377,6 +1471,8 @@ def create_onboarding_excel(
         ("Incomplete onboarding (either missing)", incomplete_count),
         ("Has accepted character application", accepted_count),
         ("Approved Player role", approved_player_count),
+        ("Members with anomalies", anomaly_member_count),
+        ("Total anomaly flags", anomaly_flag_count),
     ]
 
     start_row = 7
@@ -1482,6 +1578,9 @@ def create_onboarding_excel(
         "Accepted Application",
         "Approved Player",
         "Race Role(s)",
+        "Anomaly Count",
+        "Anomaly Severity",
+        "Anomaly Type(s)",
         "Needs Action",
         "Missing Verification + No Application",
     ]
@@ -1501,6 +1600,30 @@ def create_onboarding_excel(
         )
     ]
 
+    severity_order = {
+        "Critical": 0,
+        "High": 1,
+        "Review": 2,
+        "Clean": 3,
+    }
+
+    anomaly_rows = [
+        row
+        for row in rows
+        if row.get("Anomaly Count", 0) > 0
+    ]
+
+    anomaly_rows.sort(
+        key=lambda item: (
+            severity_order.get(
+                item.get("Anomaly Severity", "Clean"),
+                99
+            ),
+            -item.get("Anomaly Count", 0),
+            item["Display Name"].casefold(),
+        )
+    )
+
     write_data_sheet(
         workbook,
         "No Verify + No App",
@@ -1516,6 +1639,49 @@ def create_onboarding_excel(
         headers,
         "IncompleteOnboardingTable"
     )
+
+    anomalies_sheet = write_data_sheet(
+        workbook,
+        "⚠️ Anomalies",
+        anomaly_rows,
+        headers,
+        "OnboardingAnomaliesTable"
+    )
+
+    if "Anomaly Severity" in headers:
+        severity_column = headers.index(
+            "Anomaly Severity"
+        ) + 1
+
+        severity_fills = {
+            "Critical": PatternFill(
+                "solid",
+                fgColor="F4CCCC"
+            ),
+            "High": PatternFill(
+                "solid",
+                fgColor="FCE5CD"
+            ),
+            "Review": PatternFill(
+                "solid",
+                fgColor="FFF2CC"
+            ),
+        }
+
+        for row_number in range(
+            2,
+            anomalies_sheet.max_row + 1
+        ):
+            cell = anomalies_sheet.cell(
+                row=row_number,
+                column=severity_column
+            )
+
+            fill = severity_fills.get(cell.value)
+
+            if fill is not None:
+                cell.fill = fill
+                cell.font = Font(bold=True)
 
     write_data_sheet(
         workbook,
@@ -1534,6 +1700,8 @@ def create_onboarding_excel(
         "incomplete": incomplete_count,
         "not_verified": not_verified_count,
         "no_application": no_application_count,
+        "anomaly_members": anomaly_member_count,
+        "anomaly_flags": anomaly_flag_count,
     }
 
 
@@ -2216,15 +2384,11 @@ async def on_message(message: discord.Message):
     if command not in REPORT_COMMANDS:
         return
 
-    permissions = message.author.guild_permissions
-
-    if not (
-        permissions.administrator
-        or permissions.manage_guild
-        or permissions.manage_roles
-    ):
+    # The onboarding report is intentionally owner-only because it
+    # contains internal member/onboarding audit data.
+    if message.author.id != message.guild.owner_id:
         await message.reply(
-            "❌ You do not have permission to generate the onboarding report."
+            "❌ Only the server owner can generate the onboarding report."
         )
         return
 
@@ -2259,7 +2423,9 @@ async def on_message(message: discord.Message):
             f"📝 **No character application:** `{result['no_application']}`\n"
             f"🚨 **Missing both verification + application:** "
             f"`{result['both_missing']}`\n"
-            f"⚠️ **Incomplete onboarding:** `{result['incomplete']}`\n\n"
+            f"⚠️ **Incomplete onboarding:** `{result['incomplete']}`\n"
+            f"🧭 **Members with anomalies:** `{result['anomaly_members']}`\n"
+            f"🚩 **Total anomaly flags:** `{result['anomaly_flags']}`\n\n"
             "The Excel file was also saved in the bot's `reports/` folder."
         )
 
