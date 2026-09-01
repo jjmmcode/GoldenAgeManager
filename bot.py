@@ -1,9 +1,17 @@
 import os
 import re
 import json
+import asyncio
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import discord
 from dotenv import load_dotenv
+from openpyxl import Workbook
+from openpyxl.chart import BarChart, Reference
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.table import Table, TableStyleInfo
 
 
 # ============================================================
@@ -80,6 +88,26 @@ APPROVED_CHARACTER_CACHE = {}
 
 # Prevents the initial backfill from running more than once per process.
 INITIAL_ACCESS_SYNC_DONE = False
+
+# Prevents duplicate role operations when Discord emits on_member_update
+# in response to a role change made by this bot.
+ACCESS_SYNC_IN_PROGRESS = set()
+
+# ------------------------------------------------------------
+# ONBOARDING REPORT SYSTEM
+# ------------------------------------------------------------
+
+REPORT_COMMANDS = {
+    "!onboardingreport",
+    "!onboarding-report",
+}
+
+REPORT_TIMEZONE = "America/Santiago"
+REPORTS_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "reports"
+)
+REPORT_IN_PROGRESS = set()
 
 
 # Lo que puede escribir el usuario -> tag real
@@ -414,115 +442,129 @@ async def sync_community_access_for_member(
     Approved Player is also temporarily removed if the member loses
     either prerequisite. If the member becomes eligible again and has
     an Accepted character application, it is restored automatically.
+
+    A small in-memory guard prevents duplicate role operations when
+    Discord emits on_member_update because of a role change made here.
     """
 
     if member.bot:
         return False
 
-    member_role, verified_role, community_role = get_access_roles(
-        member.guild
-    )
+    sync_key = (member.guild.id, member.id)
 
-    if not all((member_role, verified_role, community_role)):
-        print(
-            "⚠️ Community Access sync skipped: one or more "
-            "configured roles do not exist in this guild."
-        )
+    if sync_key in ACCESS_SYNC_IN_PROGRESS:
         return False
 
-    role_ids = {
-        role.id
-        for role in member.roles
-    }
-
-    should_have_access = (
-        MEMBER_ROLE_ID in role_ids
-        and VERIFIED_ROLE_ID in role_ids
-    )
-
-    has_access = COMMUNITY_ACCESS_ROLE_ID in role_ids
-    changed = False
+    ACCESS_SYNC_IN_PROGRESS.add(sync_key)
 
     try:
-        if should_have_access and not has_access:
-            await member.add_roles(
-                community_role,
-                reason=reason
-            )
-
-            print(
-                f"🎟️ Community Access granted to "
-                f"{member} ({member.id})."
-            )
-            changed = True
-
-        elif not should_have_access and has_access:
-            await member.remove_roles(
-                community_role,
-                reason=reason
-            )
-
-            print(
-                f"🔒 Community Access removed from "
-                f"{member} ({member.id})."
-            )
-            changed = True
-
-        approved_player_role = member.guild.get_role(
-            APPROVED_PLAYER_ROLE_ID
+        member_role, verified_role, community_role = get_access_roles(
+            member.guild
         )
 
-        if approved_player_role is not None:
-            has_approved_player = (
-                approved_player_role in member.roles
+        if not all((member_role, verified_role, community_role)):
+            print(
+                "⚠️ Community Access sync skipped: one or more "
+                "configured roles do not exist in this guild."
             )
+            return False
 
-            # No Member + Verified means no Minecraft/IP access.
-            if not should_have_access and has_approved_player:
-                await member.remove_roles(
-                    approved_player_role,
-                    reason=(
-                        "Golden Age Manager: access prerequisites lost"
-                    )
+        role_ids = {
+            role.id
+            for role in member.roles
+        }
+
+        should_have_access = (
+            MEMBER_ROLE_ID in role_ids
+            and VERIFIED_ROLE_ID in role_ids
+        )
+
+        has_access = COMMUNITY_ACCESS_ROLE_ID in role_ids
+        changed = False
+
+        try:
+            if should_have_access and not has_access:
+                await member.add_roles(
+                    community_role,
+                    reason=reason
                 )
 
                 print(
-                    f"🔒 Approved Player temporarily removed from "
-                    f"{member} because Member + Verified is incomplete."
+                    f"🎟️ Community Access granted to "
+                    f"{member} ({member.id})."
                 )
                 changed = True
 
-            # Restore Approved Player automatically for accepted characters.
-            elif should_have_access:
-                approved_race = APPROVED_CHARACTER_CACHE.get(
-                    member.id
+            elif not should_have_access and has_access:
+                await member.remove_roles(
+                    community_role,
+                    reason=reason
                 )
 
-                if approved_race:
-                    ok, result = await grant_character_access_roles(
-                        member,
-                        approved_race
+                print(
+                    f"🔒 Community Access removed from "
+                    f"{member} ({member.id})."
+                )
+                changed = True
+
+            approved_player_role = member.guild.get_role(
+                APPROVED_PLAYER_ROLE_ID
+            )
+
+            if approved_player_role is not None:
+                has_approved_player = (
+                    approved_player_role in member.roles
+                )
+
+                # No Member + Verified means no Minecraft/IP access.
+                if not should_have_access and has_approved_player:
+                    await member.remove_roles(
+                        approved_player_role,
+                        reason=(
+                            "Golden Age Manager: access prerequisites lost"
+                        )
                     )
 
-                    if not ok:
-                        print(
-                            f"⚠️ Could not restore character access for "
-                            f"{member}: {result}"
+                    print(
+                        f"🔒 Approved Player temporarily removed from "
+                        f"{member} because Member + Verified is incomplete."
+                    )
+                    changed = True
+
+                # Restore Approved Player automatically for accepted characters.
+                elif should_have_access:
+                    approved_race = APPROVED_CHARACTER_CACHE.get(
+                        member.id
+                    )
+
+                    if approved_race:
+                        ok, result = await grant_character_access_roles(
+                            member,
+                            approved_race
                         )
 
-    except discord.Forbidden:
-        print(
-            f"❌ Could not update access roles for {member}. "
-            "Check Manage Roles and role hierarchy."
-        )
+                        if not ok:
+                            print(
+                                f"⚠️ Could not restore character access for "
+                                f"{member}: {result}"
+                            )
 
-    except discord.HTTPException as error:
-        print(
-            f"❌ Discord API error while synchronizing "
-            f"access for {member}: {error}"
-        )
+        except discord.Forbidden:
+            print(
+                f"❌ Could not update access roles for {member}. "
+                "Check Manage Roles and role hierarchy."
+            )
 
-    return changed
+        except discord.HTTPException as error:
+            print(
+                f"❌ Discord API error while synchronizing "
+                f"access for {member}: {error}"
+            )
+
+        return changed
+
+    finally:
+        ACCESS_SYNC_IN_PROGRESS.discard(sync_key)
 
 
 async def rebuild_approved_character_cache():
@@ -851,6 +893,696 @@ async def sync_processed_character_access():
         f"✅ Processed character access sync complete. "
         f"Checked/granted: {successful}"
     )
+
+
+# ============================================================
+# ONBOARDING REPORT
+# ============================================================
+
+def get_application_status(thread: discord.Thread) -> str:
+    """Returns a simple status derived from the forum tags."""
+
+    tag_names = {
+        normalize(tag.name)
+        for tag in thread.applied_tags
+    }
+
+    if normalize(CHARACTER_ACCEPTED_TAG) in tag_names:
+        return "Accepted"
+
+    if normalize(CHARACTER_REJECTED_TAG) in tag_names:
+        return "Rejected"
+
+    if "pending" in tag_names:
+        return "Pending"
+
+    return "No Status"
+
+
+async def collect_character_application_index(
+    guild: discord.Guild
+):
+    """
+    Builds user_id -> list of character applications from the source forum,
+    including archived applications.
+    """
+
+    forum = await get_channel(
+        CHARACTER_APPLICATION_FORUM_ID
+    )
+
+    if not isinstance(forum, discord.ForumChannel):
+        raise RuntimeError(
+            "character-application forum could not be found."
+        )
+
+    threads = []
+    seen_thread_ids = set()
+
+    for thread in forum.threads:
+        if thread.id not in seen_thread_ids:
+            threads.append(thread)
+            seen_thread_ids.add(thread.id)
+
+    try:
+        async for thread in forum.archived_threads(limit=None):
+            if thread.id not in seen_thread_ids:
+                threads.append(thread)
+                seen_thread_ids.add(thread.id)
+
+    except (discord.Forbidden, discord.HTTPException) as error:
+        print(
+            f"⚠️ Could not read every archived character application "
+            f"for report: {error}"
+        )
+
+    application_index = {}
+
+    for thread in threads:
+        owner_id = thread.owner_id
+
+        if owner_id is None:
+            starter_message = await get_starter_message(thread)
+
+            if starter_message is None:
+                continue
+
+            owner_id = starter_message.author.id
+
+        record = {
+            "thread_id": thread.id,
+            "thread_name": thread.name,
+            "status": get_application_status(thread),
+            "created_at": thread.created_at,
+            "url": (
+                f"https://discord.com/channels/"
+                f"{guild.id}/{thread.id}"
+            ),
+        }
+
+        application_index.setdefault(
+            owner_id,
+            []
+        ).append(record)
+
+    for records in application_index.values():
+        records.sort(
+            key=lambda item: item["created_at"],
+            reverse=True
+        )
+
+    return application_index
+
+
+async def get_complete_member_list(guild: discord.Guild):
+    """Fetches a complete member list when possible, with cache fallback."""
+
+    try:
+        members = [
+            member
+            async for member in guild.fetch_members(limit=None)
+        ]
+        return members
+
+    except (discord.Forbidden, discord.HTTPException) as error:
+        print(
+            f"⚠️ Full member fetch failed; using Discord cache instead: "
+            f"{error}"
+        )
+        return list(guild.members)
+
+
+def build_onboarding_rows(
+    guild: discord.Guild,
+    members,
+    application_index
+):
+    """Builds plain dictionaries that can safely be written to Excel."""
+
+    race_role_ids = set(
+        CHARACTER_RACE_ROLE_IDS.values()
+    )
+
+    rows = []
+
+    for member in members:
+        if member.bot:
+            continue
+
+        role_ids = {
+            role.id
+            for role in member.roles
+        }
+
+        has_member = MEMBER_ROLE_ID in role_ids
+        is_verified = VERIFIED_ROLE_ID in role_ids
+        has_community_access = (
+            COMMUNITY_ACCESS_ROLE_ID in role_ids
+        )
+        has_approved_player = (
+            APPROVED_PLAYER_ROLE_ID in role_ids
+        )
+
+        applications = application_index.get(
+            member.id,
+            []
+        )
+
+        has_application = bool(applications)
+        application_count = len(applications)
+        latest_application = (
+            applications[0]
+            if applications
+            else None
+        )
+
+        latest_status = (
+            latest_application["status"]
+            if latest_application
+            else "No Application"
+        )
+
+        latest_application_name = (
+            latest_application["thread_name"]
+            if latest_application
+            else ""
+        )
+
+        latest_application_url = (
+            latest_application["url"]
+            if latest_application
+            else ""
+        )
+
+        accepted_application = any(
+            item["status"] == "Accepted"
+            for item in applications
+        )
+
+        pending_application = any(
+            item["status"] == "Pending"
+            for item in applications
+        )
+
+        rejected_application = any(
+            item["status"] == "Rejected"
+            for item in applications
+        )
+
+        race_roles = [
+            role.name
+            for role in member.roles
+            if role.id in race_role_ids
+        ]
+
+        missing_actions = []
+
+        if not is_verified:
+            missing_actions.append("Complete verification")
+
+        if not has_application:
+            missing_actions.append("Submit character application")
+
+        if (
+            accepted_application
+            and is_verified
+            and not has_approved_player
+        ):
+            missing_actions.append(
+                "Approved character exists but Approved Player is missing"
+            )
+
+        if not missing_actions:
+            if pending_application and not accepted_application:
+                missing_actions.append("Application awaiting Staff review")
+            elif rejected_application and not accepted_application:
+                missing_actions.append(
+                    "Character application rejected; review/resubmit if needed"
+                )
+            else:
+                missing_actions.append("Complete")
+
+        joined_at = ""
+        if member.joined_at is not None:
+            joined_at = member.joined_at.astimezone(
+                ZoneInfo(REPORT_TIMEZONE)
+            ).strftime("%Y-%m-%d %H:%M:%S")
+
+        rows.append({
+            "Discord Username": str(member),
+            "Display Name": member.display_name,
+            "User ID": str(member.id),
+            "Joined Server": joined_at,
+            "Member Role": "Yes" if has_member else "No",
+            "Verified": "Yes" if is_verified else "No",
+            "Community Access": (
+                "Yes" if has_community_access else "No"
+            ),
+            "Character Application": (
+                "Yes" if has_application else "No"
+            ),
+            "Latest Application Status": latest_status,
+            "Application Count": application_count,
+            "Latest Application": latest_application_name,
+            "Latest Application Link": latest_application_url,
+            "Accepted Application": (
+                "Yes" if accepted_application else "No"
+            ),
+            "Approved Player": (
+                "Yes" if has_approved_player else "No"
+            ),
+            "Race Role(s)": ", ".join(race_roles),
+            "Needs Action": "; ".join(missing_actions),
+            "Missing Verification + No Application": (
+                "Yes"
+                if (not is_verified and not has_application)
+                else "No"
+            ),
+        })
+
+    rows.sort(
+        key=lambda item: (
+            item["Display Name"].casefold(),
+            item["Discord Username"].casefold(),
+        )
+    )
+
+    return rows
+
+
+def style_report_sheet(
+    worksheet,
+    *,
+    table_name: str,
+    add_table: bool = True
+):
+    """Applies a consistent, readable Excel style."""
+
+    header_fill = PatternFill(
+        "solid",
+        fgColor="1F4E78"
+    )
+    header_font = Font(
+        color="FFFFFF",
+        bold=True
+    )
+    thin_gray = Side(
+        style="thin",
+        color="D9E2F3"
+    )
+
+    for cell in worksheet[1]:
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(
+            horizontal="center",
+            vertical="center",
+            wrap_text=True
+        )
+        cell.border = Border(
+            bottom=thin_gray
+        )
+
+    worksheet.freeze_panes = "A2"
+    worksheet.auto_filter.ref = worksheet.dimensions
+
+    for column_cells in worksheet.columns:
+        column_letter = get_column_letter(
+            column_cells[0].column
+        )
+
+        max_length = 0
+
+        for cell in column_cells:
+            value = "" if cell.value is None else str(cell.value)
+            max_length = max(
+                max_length,
+                len(value)
+            )
+            cell.alignment = Alignment(
+                vertical="top",
+                wrap_text=True
+            )
+
+        worksheet.column_dimensions[
+            column_letter
+        ].width = min(
+            max(max_length + 2, 10),
+            42
+        )
+
+    if add_table and worksheet.max_row >= 2:
+        table = Table(
+            displayName=table_name,
+            ref=(
+                f"A1:{get_column_letter(worksheet.max_column)}"
+                f"{worksheet.max_row}"
+            )
+        )
+
+        style = TableStyleInfo(
+            name="TableStyleMedium2",
+            showFirstColumn=False,
+            showLastColumn=False,
+            showRowStripes=True,
+            showColumnStripes=False,
+        )
+
+        table.tableStyleInfo = style
+        worksheet.add_table(table)
+
+
+def write_data_sheet(
+    workbook: Workbook,
+    sheet_name: str,
+    rows,
+    headers,
+    table_name: str
+):
+    worksheet = workbook.create_sheet(sheet_name)
+    worksheet.append(headers)
+
+    for row in rows:
+        worksheet.append([
+            row.get(header, "")
+            for header in headers
+        ])
+
+    style_report_sheet(
+        worksheet,
+        table_name=table_name,
+        add_table=True
+    )
+
+    # Make links clickable in the dedicated URL column.
+    if "Latest Application Link" in headers:
+        link_column = headers.index(
+            "Latest Application Link"
+        ) + 1
+
+        for row_number in range(
+            2,
+            worksheet.max_row + 1
+        ):
+            cell = worksheet.cell(
+                row=row_number,
+                column=link_column
+            )
+
+            if cell.value:
+                cell.hyperlink = cell.value
+                cell.style = "Hyperlink"
+
+    return worksheet
+
+
+def create_onboarding_excel(
+    guild_name: str,
+    rows,
+    output_path: str,
+    generated_at_text: str
+):
+    """Creates the final .xlsx report from plain Python data."""
+
+    os.makedirs(
+        os.path.dirname(output_path),
+        exist_ok=True
+    )
+
+    workbook = Workbook()
+
+    summary = workbook.active
+    summary.title = "Summary"
+
+    total_members = len(rows)
+    verified_count = sum(
+        row["Verified"] == "Yes"
+        for row in rows
+    )
+    not_verified_count = total_members - verified_count
+    has_application_count = sum(
+        row["Character Application"] == "Yes"
+        for row in rows
+    )
+    no_application_count = (
+        total_members - has_application_count
+    )
+    both_missing_count = sum(
+        row["Missing Verification + No Application"] == "Yes"
+        for row in rows
+    )
+    incomplete_count = sum(
+        (
+            row["Verified"] == "No"
+            or row["Character Application"] == "No"
+        )
+        for row in rows
+    )
+    accepted_count = sum(
+        row["Accepted Application"] == "Yes"
+        for row in rows
+    )
+    approved_player_count = sum(
+        row["Approved Player"] == "Yes"
+        for row in rows
+    )
+
+    summary.merge_cells("A1:D1")
+    summary["A1"] = "Dragon Ball: Golden Age — Onboarding Report"
+    summary["A1"].font = Font(
+        size=16,
+        bold=True,
+        color="FFFFFF"
+    )
+    summary["A1"].fill = PatternFill(
+        "solid",
+        fgColor="1F4E78"
+    )
+    summary["A1"].alignment = Alignment(
+        horizontal="center"
+    )
+
+    summary["A3"] = "Server"
+    summary["B3"] = guild_name
+    summary["A4"] = "Generated At (Chile)"
+    summary["B4"] = generated_at_text
+
+    summary_rows = [
+        ("Members analyzed", total_members),
+        ("Verified", verified_count),
+        ("Not verified", not_verified_count),
+        ("Has character application", has_application_count),
+        ("No character application", no_application_count),
+        ("Missing verification + no application", both_missing_count),
+        ("Incomplete onboarding (either missing)", incomplete_count),
+        ("Has accepted character application", accepted_count),
+        ("Approved Player role", approved_player_count),
+    ]
+
+    start_row = 7
+
+    summary.cell(
+        row=start_row,
+        column=1,
+        value="Metric"
+    )
+    summary.cell(
+        row=start_row,
+        column=2,
+        value="Count"
+    )
+
+    for offset, (label, value) in enumerate(
+        summary_rows,
+        start=1
+    ):
+        summary.cell(
+            row=start_row + offset,
+            column=1,
+            value=label
+        )
+        summary.cell(
+            row=start_row + offset,
+            column=2,
+            value=value
+        )
+
+    for cell in summary[start_row]:
+        if cell.column <= 2:
+            cell.fill = PatternFill(
+                "solid",
+                fgColor="1F4E78"
+            )
+            cell.font = Font(
+                color="FFFFFF",
+                bold=True
+            )
+
+    summary.column_dimensions["A"].width = 42
+    summary.column_dimensions["B"].width = 20
+    summary.column_dimensions["C"].width = 4
+    summary.column_dimensions["D"].width = 4
+
+    chart = BarChart()
+    chart.title = "Onboarding Gaps"
+    chart.y_axis.title = "Members"
+    chart.x_axis.title = "Status"
+    chart.height = 7
+    chart.width = 11
+
+    # Chart the three main gaps: not verified, no application, both missing.
+    chart_data_rows = [
+        start_row + 3,
+        start_row + 5,
+        start_row + 6,
+    ]
+
+    # Place compact helper data for the chart in D7:E10.
+    summary["D7"] = "Gap"
+    summary["E7"] = "Count"
+    summary["D8"] = "Not verified"
+    summary["E8"] = not_verified_count
+    summary["D9"] = "No application"
+    summary["E9"] = no_application_count
+    summary["D10"] = "Both missing"
+    summary["E10"] = both_missing_count
+
+    chart_data = Reference(
+        summary,
+        min_col=5,
+        min_row=7,
+        max_row=10
+    )
+    chart_categories = Reference(
+        summary,
+        min_col=4,
+        min_row=8,
+        max_row=10
+    )
+    chart.add_data(
+        chart_data,
+        titles_from_data=True
+    )
+    chart.set_categories(chart_categories)
+    summary.add_chart(chart, "D12")
+
+    headers = [
+        "Discord Username",
+        "Display Name",
+        "User ID",
+        "Joined Server",
+        "Member Role",
+        "Verified",
+        "Community Access",
+        "Character Application",
+        "Latest Application Status",
+        "Application Count",
+        "Latest Application",
+        "Latest Application Link",
+        "Accepted Application",
+        "Approved Player",
+        "Race Role(s)",
+        "Needs Action",
+        "Missing Verification + No Application",
+    ]
+
+    exact_rows = [
+        row
+        for row in rows
+        if row["Missing Verification + No Application"] == "Yes"
+    ]
+
+    incomplete_rows = [
+        row
+        for row in rows
+        if (
+            row["Verified"] == "No"
+            or row["Character Application"] == "No"
+        )
+    ]
+
+    write_data_sheet(
+        workbook,
+        "No Verify + No App",
+        exact_rows,
+        headers,
+        "NoVerifyNoAppTable"
+    )
+
+    write_data_sheet(
+        workbook,
+        "Incomplete Onboarding",
+        incomplete_rows,
+        headers,
+        "IncompleteOnboardingTable"
+    )
+
+    write_data_sheet(
+        workbook,
+        "All Members",
+        rows,
+        headers,
+        "AllMembersTable"
+    )
+
+    workbook.save(output_path)
+
+    return {
+        "path": output_path,
+        "total": total_members,
+        "both_missing": both_missing_count,
+        "incomplete": incomplete_count,
+        "not_verified": not_verified_count,
+        "no_application": no_application_count,
+    }
+
+
+async def generate_onboarding_report(
+    guild: discord.Guild
+):
+    """Collects live Discord data and writes a timestamped Excel report."""
+
+    application_index = await collect_character_application_index(
+        guild
+    )
+
+    members = await get_complete_member_list(
+        guild
+    )
+
+    rows = build_onboarding_rows(
+        guild,
+        members,
+        application_index
+    )
+
+    now_chile = datetime.now(
+        ZoneInfo(REPORT_TIMEZONE)
+    )
+
+    generated_at_text = now_chile.strftime(
+        "%Y-%m-%d %H:%M:%S %Z"
+    )
+
+    filename = (
+        "GoldenAge_Onboarding_Report_"
+        f"{now_chile.strftime('%Y-%m-%d_%H-%M-%S')}.xlsx"
+    )
+
+    output_path = os.path.join(
+        REPORTS_DIR,
+        filename
+    )
+
+    result = await asyncio.to_thread(
+        create_onboarding_excel,
+        guild.name,
+        rows,
+        output_path,
+        generated_at_text
+    )
+
+    return result
 
 
 def is_image_attachment(
@@ -1404,6 +2136,10 @@ async def on_ready():
         "🤖 Waiting for applications and role changes..."
     )
 
+    print(
+        "📊 Staff report command: !onboardingreport"
+    )
+
     print("=" * 65)
     print()
 
@@ -1440,12 +2176,135 @@ async def on_member_update(
     if before_ids == after_ids:
         return
 
+    sync_key = (after.guild.id, after.id)
+
+    if sync_key in ACCESS_SYNC_IN_PROGRESS:
+        return
+
     await sync_community_access_for_member(
         after,
         reason=(
             "Golden Age Manager: Member + Verified access gate"
         )
     )
+
+
+# ============================================================
+# STAFF REPORT COMMAND
+# ============================================================
+
+@client.event
+async def on_message(message: discord.Message):
+    """
+    Staff-only manual Excel report.
+
+    Commands:
+      !onboardingreport
+      !onboarding-report
+    """
+
+    if message.author.bot:
+        return
+
+    if message.guild is None:
+        return
+
+    command = normalize(
+        message.content or ""
+    )
+
+    if command not in REPORT_COMMANDS:
+        return
+
+    permissions = message.author.guild_permissions
+
+    if not (
+        permissions.administrator
+        or permissions.manage_guild
+        or permissions.manage_roles
+    ):
+        await message.reply(
+            "❌ You do not have permission to generate the onboarding report."
+        )
+        return
+
+    report_key = (
+        message.guild.id,
+        message.author.id
+    )
+
+    if report_key in REPORT_IN_PROGRESS:
+        await message.reply(
+            "⏳ An onboarding report is already being generated for you."
+        )
+        return
+
+    REPORT_IN_PROGRESS.add(report_key)
+
+    progress_message = None
+
+    try:
+        progress_message = await message.reply(
+            "📊 Generating the onboarding Excel report..."
+        )
+
+        result = await generate_onboarding_report(
+            message.guild
+        )
+
+        summary_text = (
+            "## 📊 Onboarding Report Ready\n\n"
+            f"👥 **Members analyzed:** `{result['total']}`\n"
+            f"❌ **Not verified:** `{result['not_verified']}`\n"
+            f"📝 **No character application:** `{result['no_application']}`\n"
+            f"🚨 **Missing both verification + application:** "
+            f"`{result['both_missing']}`\n"
+            f"⚠️ **Incomplete onboarding:** `{result['incomplete']}`\n\n"
+            "The Excel file was also saved in the bot's `reports/` folder."
+        )
+
+        await message.channel.send(
+            summary_text,
+            file=discord.File(
+                result["path"],
+                filename=os.path.basename(result["path"])
+            )
+        )
+
+        if progress_message is not None:
+            try:
+                await progress_message.delete()
+            except discord.HTTPException:
+                pass
+
+        print(
+            f"📊 Onboarding report generated by {message.author}: "
+            f"{result['path']}"
+        )
+
+    except Exception as error:
+        print(
+            f"❌ Onboarding report generation failed: {error!r}"
+        )
+
+        error_text = (
+            "❌ **Golden Age Manager could not generate the onboarding "
+            "report.**\n\n"
+            f"`{type(error).__name__}: {error}`"
+        )
+
+        if progress_message is not None:
+            try:
+                await progress_message.edit(
+                    content=error_text
+                )
+            except discord.HTTPException:
+                await message.channel.send(error_text)
+        else:
+            await message.channel.send(error_text)
+
+    finally:
+        REPORT_IN_PROGRESS.discard(report_key)
 
 
 # ============================================================
