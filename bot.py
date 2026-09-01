@@ -86,13 +86,22 @@ CHARACTER_RACE_ROLE_IDS = {
     "Bio-Android": 1543930297257693326,
 }
 
-# Cache built from Accepted character applications.
+# Cache used for Discord access restoration.
 # user_id -> approved race tag (for example: "Saiyan")
+# This remains member-based because Discord roles are assigned to members.
 APPROVED_CHARACTER_CACHE = {}
 
-# Accepted characters explicitly marked as Mutant in their application.
-# user_id -> {"race": canonical race tag, "name": character/display name}
+# Source-of-truth records used by Race Count.
+# source_thread_id -> {"user_id": int, "race": str, "name": str}
+# IMPORTANT: Race Count is character/application-based, not unique-user-based.
+APPROVED_CHARACTER_RECORDS = {}
+
+# Legacy/member cache kept for access compatibility.
 APPROVED_MUTANT_CACHE = {}
+
+# Source-of-truth records used by Mutant Count.
+# source_thread_id -> {"user_id": int, "race": str, "name": str}
+APPROVED_MUTANT_RECORDS = {}
 
 # Prevents the initial backfill from running more than once per process.
 INITIAL_ACCESS_SYNC_DONE = False
@@ -743,7 +752,9 @@ async def rebuild_approved_character_cache():
     """
 
     APPROVED_CHARACTER_CACHE.clear()
+    APPROVED_CHARACTER_RECORDS.clear()
     APPROVED_MUTANT_CACHE.clear()
+    APPROVED_MUTANT_RECORDS.clear()
 
     forum = await get_channel(
         CHARACTER_APPLICATION_FORUM_ID
@@ -784,6 +795,9 @@ async def rebuild_approved_character_cache():
         CHARACTER_REJECTED_TAG
     )
 
+    accepted_threads_seen = 0
+    accepted_threads_skipped = 0
+
     for thread in threads:
         tag_names = {
             normalize(tag.name)
@@ -796,11 +810,18 @@ async def rebuild_approved_character_cache():
         if rejected_name in tag_names:
             continue
 
+        accepted_threads_seen += 1
+
         starter_message = await get_starter_message(
             thread
         )
 
         if starter_message is None:
+            accepted_threads_skipped += 1
+            print(
+                f"⚠️ Accepted character skipped: '{thread.name}' "
+                "has no readable starter message."
+            )
             continue
 
         application = parse_character_application(
@@ -812,13 +833,36 @@ async def rebuild_approved_character_cache():
         )
 
         if race_tag_name is None:
+            accepted_threads_skipped += 1
+            print(
+                f"⚠️ Accepted character skipped: '{thread.name}' — "
+                f"race could not be parsed from value "
+                f"{application.get('race')!r}."
+            )
             continue
 
         user_id = starter_message.author.id
 
+        # Access restoration is member-based: one Discord member can only
+        # receive one current race-role result from this cache.
         APPROVED_CHARACTER_CACHE[
             user_id
         ] = race_tag_name
+
+        # Public population counts are CHARACTER-based. Each Accepted
+        # application/thread occupies one race slot, even if the same Discord
+        # member owns more than one approved character.
+        character_display_name = (
+            application.get("character_name")
+            or thread.name
+            or starter_message.author.display_name
+        )
+
+        APPROVED_CHARACTER_RECORDS[thread.id] = {
+            "user_id": user_id,
+            "race": race_tag_name,
+            "name": character_display_name,
+        }
 
         is_mutant = (
             normalize(CHARACTER_MUTANT_TAG) in tag_names
@@ -829,7 +873,8 @@ async def rebuild_approved_character_cache():
         )
 
         if is_mutant:
-            APPROVED_MUTANT_CACHE[user_id] = {
+            mutant_record = {
+                "user_id": user_id,
                 "race": race_tag_name,
                 "name": mutant_display_name(
                     application,
@@ -837,15 +882,43 @@ async def rebuild_approved_character_cache():
                 ),
             }
 
+            APPROVED_MUTANT_CACHE[user_id] = mutant_record
+            APPROVED_MUTANT_RECORDS[thread.id] = mutant_record
+
     print(
-        f"🎮 Approved character cache rebuilt: "
-        f"{len(APPROVED_CHARACTER_CACHE)} player(s)."
+        f"🎮 Approved character access cache rebuilt: "
+        f"{len(APPROVED_CHARACTER_CACHE)} unique player(s)."
     )
 
     print(
-        f"🧬 Approved mutant cache rebuilt: "
-        f"{len(APPROVED_MUTANT_CACHE)} mutant(s)."
+        f"📚 Accepted character applications counted: "
+        f"{len(APPROVED_CHARACTER_RECORDS)} character(s) "
+        f"from {accepted_threads_seen} Accepted thread(s)."
     )
+
+    if accepted_threads_skipped:
+        print(
+            f"⚠️ Accepted applications skipped during counting: "
+            f"{accepted_threads_skipped}. See warnings above."
+        )
+
+    print(
+        f"🧬 Approved mutants counted: "
+        f"{len(APPROVED_MUTANT_RECORDS)} mutant character(s)."
+    )
+
+    # Per-race diagnostics make population mismatches easy to spot in Kinetic.
+    diagnostic_counts = {}
+    for record in APPROVED_CHARACTER_RECORDS.values():
+        race_name = record.get("race", "Unknown")
+        diagnostic_counts[race_name] = diagnostic_counts.get(race_name, 0) + 1
+
+    if diagnostic_counts:
+        diagnostic_text = ", ".join(
+            f"{race}: {count}"
+            for race, count in sorted(diagnostic_counts.items())
+        )
+        print(f"📊 Accepted race breakdown: {diagnostic_text}")
 
 
 def get_race_counts():
@@ -856,7 +929,8 @@ def get_race_counts():
         for race_tag in RACE_COUNT_LIMITS
     }
 
-    for race_tag_name in APPROVED_CHARACTER_CACHE.values():
+    for record in APPROVED_CHARACTER_RECORDS.values():
+        race_tag_name = record.get("race")
         if race_tag_name in counts:
             counts[race_tag_name] += 1
 
@@ -871,7 +945,7 @@ def get_mutant_counts():
         for race_tag in MUTANT_COUNT_RACES
     }
 
-    for record in APPROVED_MUTANT_CACHE.values():
+    for record in APPROVED_MUTANT_RECORDS.values():
         race_tag = record.get("race")
         name = record.get("name") or "Unknown"
 
@@ -4029,6 +4103,10 @@ async def handle_character_application(
             approved_thread.id
         )
 
+
+        # Re-scan Accepted applications so the public counter is based on
+        # accepted CHARACTER THREADS rather than unique Discord users.
+        await rebuild_approved_character_cache()
 
         await update_race_count_message(
             reason=f"approved {display_name}"
