@@ -47,6 +47,15 @@ MENTOR_APPROVAL_MAPPING = {
 
 MENTOR_REJECTED_TAG = "Rejected"
 
+# Public mentor directory message. Uses the same #information channel as
+# Race Count so players can quickly see who currently mentors each type.
+MENTOR_LIST_CHANNEL_ID = 1543938120301551626
+
+# Source-of-truth records: one record per currently approved Mentor Application.
+# source_thread_id -> {"user_id", "character", "skill", "type", "thread_name"}
+APPROVED_MENTOR_RECORDS = {}
+MENTOR_LIST_LOCK = asyncio.Lock()
+
 
 # ------------------------------------------------------------
 # CHARACTER SYSTEM
@@ -2979,6 +2988,256 @@ def parse_mentor_application(
 
 
 # ============================================================
+# MENTOR LIST / DIRECTORY
+# ============================================================
+
+async def rebuild_approved_mentor_records():
+    """
+    Rebuild the public mentor directory from the current approval tags on
+    Mentor Applications (including archived threads).
+
+    The source application is authoritative. The approved-mentors profile is
+    a presentation copy and can be recreated if Staff deletes it by mistake.
+    """
+
+    APPROVED_MENTOR_RECORDS.clear()
+
+    forum = await get_channel(MENTOR_APPLICATION_FORUM_ID)
+
+    if not isinstance(forum, discord.ForumChannel):
+        print(
+            "⚠️ Could not rebuild mentor list: "
+            "mentor-application forum not found."
+        )
+        return
+
+    rejected_name = normalize(MENTOR_REJECTED_TAG)
+    source_to_destination = {
+        normalize(source): destination
+        for source, destination in MENTOR_APPROVAL_MAPPING.items()
+    }
+
+    approved_threads_seen = 0
+    skipped = 0
+
+    for thread in await collect_forum_threads(forum):
+        tag_names = {
+            normalize(tag.name)
+            for tag in thread.applied_tags
+        }
+
+        if rejected_name in tag_names:
+            continue
+
+        mentorship_type = None
+        for source_normalized, destination_name in source_to_destination.items():
+            if source_normalized in tag_names:
+                mentorship_type = destination_name
+                break
+
+        if mentorship_type is None:
+            continue
+
+        approved_threads_seen += 1
+
+        starter_message = await get_starter_message(thread)
+        if starter_message is None:
+            skipped += 1
+            print(
+                f"⚠️ Approved mentor skipped: '{thread.name}' "
+                "has no readable starter message."
+            )
+            continue
+
+        application = parse_mentor_application(
+            starter_message.content or ""
+        )
+
+        character = (
+            application.get("character")
+            or starter_message.author.display_name
+            or thread.name
+        )
+        skill = application.get("skill") or thread.name
+
+        APPROVED_MENTOR_RECORDS[thread.id] = {
+            "user_id": starter_message.author.id,
+            "character": character,
+            "skill": skill,
+            "type": mentorship_type,
+            "thread_name": thread.name,
+        }
+
+    print(
+        f"🎓 Approved Mentor Applications counted: "
+        f"{len(APPROVED_MENTOR_RECORDS)} mentor(s) "
+        f"from {approved_threads_seen} approved thread(s)."
+    )
+
+    if skipped:
+        print(
+            f"⚠️ Approved mentor applications skipped: {skipped}."
+        )
+
+    diagnostic_counts = {}
+    for record in APPROVED_MENTOR_RECORDS.values():
+        mentor_type = record.get("type", "Unknown")
+        diagnostic_counts[mentor_type] = diagnostic_counts.get(mentor_type, 0) + 1
+
+    if diagnostic_counts:
+        diagnostic_text = ", ".join(
+            f"{mentor_type}: {count}"
+            for mentor_type, count in sorted(diagnostic_counts.items())
+        )
+        print(f"🎓 Mentor breakdown: {diagnostic_text}")
+
+
+def build_mentor_list_message():
+    """Build a compact public list of all currently approved mentors."""
+
+    display = {
+        "Technique": ("🎯", "Technique Mentors"),
+        "Custom-Form": ("🧬", "Custom Form Mentors"),
+        "Passive-Skill": ("✨", "Passive Skill Mentors"),
+    }
+
+    grouped = {key: [] for key in display}
+
+    for record in APPROVED_MENTOR_RECORDS.values():
+        mentor_type = record.get("type")
+        if mentor_type not in grouped:
+            continue
+
+        character = str(record.get("character") or "Unknown Mentor").strip()
+        skill = str(record.get("skill") or record.get("thread_name") or "Unknown Skill").strip()
+        grouped[mentor_type].append((character, skill))
+
+    for entries in grouped.values():
+        entries.sort(key=lambda item: (item[0].casefold(), item[1].casefold()))
+
+    lines = [
+        "## 🎓 Mentor List",
+        "",
+    ]
+
+    for mentor_type, (emoji, heading) in display.items():
+        lines.append(f"### {emoji} {heading}")
+        entries = grouped[mentor_type]
+
+        if entries:
+            for character, skill in entries:
+                lines.append(f"• **{character}** — {skill}")
+        else:
+            lines.append("• None")
+
+        lines.append("")
+
+    lines.extend([
+        "-# Automatically updated by Golden Age Manager.",
+        "-# Only currently approved Mentor Applications are listed.",
+    ])
+
+    content = "\n".join(lines)
+
+    # Discord messages are limited to 2,000 characters. Keep the directory
+    # usable even if the mentorship program becomes much larger.
+    if len(content) > 1990:
+        content = content[:1900].rstrip() + (
+            "\n\n-# Mentor List truncated because it exceeded Discord's message limit."
+        )
+
+    return content
+
+
+async def get_mentor_list_message(channel: discord.TextChannel):
+    """Find Golden Age Manager's managed Mentor List message."""
+
+    meta = PROCESSED_APPLICATIONS.setdefault("meta", {})
+    stored_message_id = meta.get("mentor_list_message_id")
+
+    if stored_message_id:
+        try:
+            message = await channel.fetch_message(int(stored_message_id))
+            if message.author.id == client.user.id:
+                return message
+        except (
+            discord.NotFound,
+            discord.Forbidden,
+            discord.HTTPException,
+            ValueError,
+            TypeError,
+        ):
+            pass
+
+    try:
+        async for message in channel.history(limit=100):
+            if (
+                message.author.id == client.user.id
+                and "## 🎓 Mentor List" in (message.content or "")
+                and "Automatically updated by Golden Age Manager"
+                in (message.content or "")
+            ):
+                meta["mentor_list_message_id"] = message.id
+                save_processed_applications()
+                return message
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+
+    return None
+
+
+async def update_mentor_list_message(reason: str = "automatic update"):
+    """Create or edit the managed Mentor List in #information."""
+
+    async with MENTOR_LIST_LOCK:
+        channel = await get_channel(MENTOR_LIST_CHANNEL_ID)
+
+        if not isinstance(channel, discord.TextChannel):
+            print(
+                "⚠️ Mentor List channel was not found or is not a text channel."
+            )
+            return False
+
+        content = build_mentor_list_message()
+        message = await get_mentor_list_message(channel)
+
+        try:
+            if message is None:
+                message = await channel.send(content)
+                PROCESSED_APPLICATIONS.setdefault(
+                    "meta", {}
+                )["mentor_list_message_id"] = message.id
+                save_processed_applications()
+                print(
+                    f"🎓 Mentor List message created in #{channel.name}."
+                )
+            elif message.content != content:
+                await message.edit(content=content)
+                print(
+                    f"🎓 Mentor List updated ({reason})."
+                )
+            else:
+                print(
+                    f"🎓 Mentor List already current ({reason})."
+                )
+
+            return True
+
+        except discord.Forbidden:
+            print(
+                "❌ Golden Age Manager cannot create/edit the Mentor List. "
+                "Check View Channel, Send Messages and Read Message History."
+            )
+            return False
+
+        except discord.HTTPException as error:
+            print(
+                f"❌ Discord API error while updating Mentor List: {error}"
+            )
+            return False
+
+
+# ============================================================
 # CHARACTER PARSER
 # ============================================================
 
@@ -3437,6 +3696,8 @@ async def on_ready():
     global INITIAL_ACCESS_SYNC_DONE
 
     if not INITIAL_ACCESS_SYNC_DONE:
+        await rebuild_approved_mentor_records()
+        await update_mentor_list_message(reason="startup")
         await rebuild_approved_character_cache()
         await rebuild_approved_mutant_cache()
         await update_race_count_message(reason="startup")
@@ -3691,6 +3952,32 @@ async def handle_mentor_application(
         after_tags - before_tags
     )
 
+    removed_tags = (
+        before_tags - after_tags
+    )
+
+    approval_tag_names = {
+        normalize(source_tag)
+        for source_tag in MENTOR_APPROVAL_MAPPING
+    }
+
+    approval_removed = bool(
+        removed_tags & approval_tag_names
+    )
+
+    # If Staff removes an approval tag, immediately remove that mentor from
+    # the public directory. The approved profile itself is intentionally not
+    # deleted automatically; restoring the approval tag will either reuse the
+    # existing profile or rebuild it if Staff deleted it manually.
+    if approval_removed:
+        await rebuild_approved_mentor_records()
+        await update_mentor_list_message(
+            reason="mentor approval tag removed"
+        )
+
+        if not newly_added:
+            return
+
     if not newly_added:
         return
 
@@ -3706,6 +3993,11 @@ async def handle_mentor_application(
         await reject_application(
             after,
             "Mentor Application"
+        )
+
+        await rebuild_approved_mentor_records()
+        await update_mentor_list_message(
+            reason="mentor application rejected"
         )
 
         return
@@ -3742,7 +4034,7 @@ async def handle_mentor_application(
 
 
     # --------------------------------------------------------
-    # DUPLICATE PROTECTION
+    # DUPLICATE PROTECTION + SELF-HEALING
     # --------------------------------------------------------
 
     if application_was_processed(
@@ -3750,12 +4042,37 @@ async def handle_mentor_application(
         after.id
     ):
 
-        print(
-            "⚠️ This mentor application was "
-            "already processed. Ignoring duplicate."
+        destination_exists = await processed_destination_exists(
+            "mentor",
+            after.id,
+            APPROVED_MENTORS_FORUM_ID
         )
 
-        return
+        if destination_exists:
+            await rebuild_approved_mentor_records()
+            await update_mentor_list_message(
+                reason="mentor approval tag restored"
+            )
+
+            print(
+                "⚠️ This mentor application was already processed. "
+                "Profile duplicate skipped; Mentor List refreshed."
+            )
+
+            return
+
+        # The source still has a stale processed marker but the copied
+        # approved-mentors profile was deleted. Clear the marker and continue
+        # through the normal approval flow so the profile is recreated.
+        unmark_application_processed(
+            "mentor",
+            after.id
+        )
+
+        print(
+            "♻️ Processed mentor profile is missing from approved-mentors. "
+            "Rebuilding it now..."
+        )
 
 
     print()
@@ -4022,6 +4339,11 @@ async def handle_mentor_application(
         print(
             "🔒 Original mentor application "
             "archived."
+        )
+
+        await rebuild_approved_mentor_records()
+        await update_mentor_list_message(
+            reason="mentor approved"
         )
 
         print(
