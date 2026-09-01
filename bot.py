@@ -862,6 +862,7 @@ async def rebuild_approved_character_cache():
             "user_id": user_id,
             "race": race_tag_name,
             "name": character_display_name,
+            "thread_name": thread.name,
         }
 
         is_mutant = (
@@ -919,6 +920,99 @@ async def rebuild_approved_character_cache():
             for race, count in sorted(diagnostic_counts.items())
         )
         print(f"📊 Accepted race breakdown: {diagnostic_text}")
+
+    await audit_approved_character_registry()
+
+
+async def audit_approved_character_registry():
+    """Compare Accepted source apps with bot-managed approved profiles."""
+    forum = await get_channel(APPROVED_CHARACTERS_FORUM_ID)
+    if not isinstance(forum, discord.ForumChannel):
+        print("⚠️ Race audit skipped: approved-characters forum not found.")
+        return
+
+    threads = []
+    seen_ids = set()
+    for thread in forum.threads:
+        if thread.id not in seen_ids:
+            threads.append(thread)
+            seen_ids.add(thread.id)
+
+    try:
+        async for thread in forum.archived_threads(limit=None):
+            if thread.id not in seen_ids:
+                threads.append(thread)
+                seen_ids.add(thread.id)
+    except (discord.Forbidden, discord.HTTPException) as error:
+        print(f"⚠️ Race audit could not read all archived approved profiles: {error}")
+
+    accepted_by_race = {race: [] for race in RACE_COUNT_LIMITS}
+    for record in APPROVED_CHARACTER_RECORDS.values():
+        race = record.get("race")
+        name = record.get("thread_name") or record.get("name") or "Unknown"
+        if race in accepted_by_race:
+            accepted_by_race[race].append(name)
+
+    registry_by_race = {race: [] for race in RACE_COUNT_LIMITS}
+    for thread in threads:
+        race_tag = None
+        for tag in thread.applied_tags:
+            for canonical_race in RACE_COUNT_LIMITS:
+                if normalize(tag.name) == normalize(canonical_race):
+                    race_tag = canonical_race
+                    break
+            if race_tag:
+                break
+
+        if race_tag is None:
+            continue
+
+        starter = await get_starter_message(thread)
+        if starter is None:
+            continue
+
+        # Count only bot-created approved profiles; manual/legacy posts such as
+        # Sarkala remain excluded from this comparison.
+        if client.user is None or starter.author.id != client.user.id:
+            continue
+
+        registry_by_race[race_tag].append(thread.name)
+
+    print("🔎 Race registry audit:")
+    mismatch_found = False
+
+    for race in RACE_COUNT_LIMITS:
+        accepted_names = sorted(accepted_by_race[race], key=str.casefold)
+        registry_names = sorted(registry_by_race[race], key=str.casefold)
+        accepted_keys = {normalize(name): name for name in accepted_names}
+        registry_keys = {normalize(name): name for name in registry_names}
+
+        if len(accepted_names) != len(registry_names):
+            mismatch_found = True
+            display = RACE_COUNT_LIMITS[race][0]
+            print(
+                f"   ⚠️ {display}: Accepted apps={len(accepted_names)}, "
+                f"bot-managed approved profiles={len(registry_names)}"
+            )
+
+        for key, name in registry_keys.items():
+            if key not in accepted_keys:
+                mismatch_found = True
+                print(
+                    f"      🟠 Approved profile without current Accepted source: "
+                    f"[{RACE_COUNT_LIMITS[race][0]}] {name}"
+                )
+
+        for key, name in accepted_keys.items():
+            if key not in registry_keys:
+                mismatch_found = True
+                print(
+                    f"      🔴 Accepted application missing approved profile: "
+                    f"[{RACE_COUNT_LIMITS[race][0]}] {name}"
+                )
+
+    if not mismatch_found:
+        print("   ✅ Accepted applications and bot-managed approved profiles match.")
 
 
 def get_race_counts():
