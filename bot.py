@@ -3141,9 +3141,19 @@ async def handle_character_application(
         after.id
     ):
 
+        # The profile was already published previously, so do not
+        # create a duplicate approved-character thread. However, the
+        # Accepted tag may have just been restored after a test or
+        # staff correction. Rebuild the cache and refresh Race Count
+        # before returning.
+        await rebuild_approved_character_cache()
+        await update_race_count_message(
+            reason="Accepted tag restored on processed application"
+        )
+
         print(
-            "⚠️ This character application was "
-            "already processed. Ignoring duplicate."
+            "⚠️ This character application was already processed. "
+            "Profile duplicate skipped; Race Count refreshed."
         )
 
         return
