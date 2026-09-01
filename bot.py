@@ -2293,6 +2293,60 @@ def parse_mentor_application(
 # CHARACTER PARSER
 # ============================================================
 
+def extract_character_race_fallback(content: str):
+    """
+    Extract Race/Species from common Discord application formatting.
+
+    This fallback is intentionally tolerant of Markdown such as:
+    **Race:** Namekian
+    __Race__: Saiyan
+    > Race: Arcosian
+
+    It is only used when the generic labeled-field parser did not
+    return a race value.
+    """
+
+    if not content:
+        return None
+
+    # Prefer a Race/Species label at the beginning of a line.
+    # The pattern allows common Discord Markdown before/around the label
+    # and supports both ASCII ':' and full-width '：'.
+    line_pattern = re.compile(
+        r"(?im)^[\s>*#\-•|`~_]*"
+        r"(?:\*{0,2}|_{0,2})"
+        r"(?:race|species)"
+        r"(?:\*{0,2}|_{0,2})"
+        r"\s*[:：]\s*"
+        r"(?:\*{0,2}|_{0,2})?"
+        r"([^\r\n]+)"
+    )
+
+    match = line_pattern.search(content)
+
+    # Some old applications place several fields on one line.
+    # Use a second, more permissive search if needed.
+    if match is None:
+        inline_pattern = re.compile(
+            r"(?i)(?<!\w)(?:race|species)\s*[:：]\s*"
+            r"(?:\*{0,2}|_{0,2})?"
+            r"(.+?)"
+            r"(?=\s+(?:alignment|class|combat\s*role|age|sex|gender|family|alias|nickname|fighting\s*style|combat\s*style)\s*[:：]|$)"
+        )
+        match = inline_pattern.search(content.replace("\n", " "))
+
+    if match is None:
+        return None
+
+    value = match.group(1).strip()
+
+    # Remove trailing Markdown and obvious decoration without changing
+    # the actual race text. detect_race_tag() normalizes the rest.
+    value = re.sub(r"[\s*_`~]+$", "", value).strip()
+
+    return value or None
+
+
 def parse_character_application(
     content: str
 ):
@@ -2300,6 +2354,7 @@ def parse_character_application(
     aliases = {
 
         "character_name": [
+            r"birth\s*name",
             r"character\s*name",
             r"character",
             r"name",
@@ -2316,6 +2371,7 @@ def parse_character_application(
         ],
 
         "class": [
+            r"combat\s*role",
             r"class",
         ],
 
@@ -2352,10 +2408,22 @@ def parse_character_application(
         ],
     }
 
-    return parse_labeled_fields(
+    application = parse_labeled_fields(
         content,
         aliases
     )
+
+    if not application.get("race"):
+        fallback_race = extract_character_race_fallback(content)
+
+        if fallback_race:
+            application["race"] = fallback_race
+            print(
+                f"🧬 Race parser fallback detected: "
+                f"{fallback_race!r}"
+            )
+
+    return application
 
 
 # ============================================================
