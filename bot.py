@@ -57,6 +57,10 @@ APPROVED_CHARACTERS_FORUM_ID = 1543909774062518333
 
 CHARACTER_ACCEPTED_TAG = "Accepted"
 CHARACTER_REJECTED_TAG = "Rejected"
+# Optional moderated forum tag. If present on an Accepted application, the
+# character is included in Mutant Count even if the legacy application text
+# has no explicit Mutant field.
+CHARACTER_MUTANT_TAG = "Mutant"
 
 
 # ------------------------------------------------------------
@@ -86,6 +90,10 @@ CHARACTER_RACE_ROLE_IDS = {
 # user_id -> approved race tag (for example: "Saiyan")
 APPROVED_CHARACTER_CACHE = {}
 
+# Accepted characters explicitly marked as Mutant in their application.
+# user_id -> {"race": canonical race tag, "name": character/display name}
+APPROVED_MUTANT_CACHE = {}
+
 # Prevents the initial backfill from running more than once per process.
 INITIAL_ACCESS_SYNC_DONE = False
 
@@ -111,6 +119,17 @@ RACE_COUNT_LIMITS = {
     "Majin": ("Majin", 10),
 }
 
+# Mutant Count follows the categories used in #information.
+# Android is intentionally not a separate mutant category.
+MUTANT_COUNT_RACES = {
+    "Saiyan": "Saiyan",
+    "Human": "Human",
+    "Namekian": "Namekian",
+    "Frost-Demon": "Arcosian",
+    "Bio-Android": "Bio-Android",
+    "Majin": "Majin",
+}
+
 RACE_COUNT_LOCK = asyncio.Lock()
 
 # ------------------------------------------------------------
@@ -131,16 +150,31 @@ REPORT_IN_PROGRESS = set()
 
 
 # Lo que puede escribir el usuario -> tag real
+#
+# This mapping is intentionally generous because legacy applications use
+# different spellings, punctuation, aliases and race names. The longest
+# matching alias wins, so "bio android" is resolved before plain "android".
 RACE_MAPPING = {
-    # Saiyans
+    # Saiyans / Hybrids
     "saiyan": "Saiyan",
+    "saiyajin": "Saiyan",
+    "saiyan race": "Saiyan",
+    "pure saiyan": "Saiyan",
     "pure blood saiyan": "Saiyan",
     "pure-blood saiyan": "Saiyan",
     "pureblood saiyan": "Saiyan",
+    "full blooded saiyan": "Saiyan",
+    "full-blooded saiyan": "Saiyan",
     "saiyan hybrid": "Saiyan",
+    "saiyan/hybrid": "Saiyan",
     "hybrid saiyan": "Saiyan",
+    "hybrid": "Saiyan",
     "half saiyan": "Saiyan",
     "half-saiyan": "Saiyan",
+    "half blood saiyan": "Saiyan",
+    "half-blood saiyan": "Saiyan",
+    "mutant saiyan": "Saiyan",
+    "saiyan mutant": "Saiyan",
 
     # Frost Demon / Arcosian
     "frost demon": "Frost-Demon",
@@ -148,30 +182,65 @@ RACE_MAPPING = {
     "frost demon clan": "Frost-Demon",
     "arcosian": "Frost-Demon",
     "acrosian": "Frost-Demon",
+    "arcosian frost demon": "Frost-Demon",
+    "arcosian/frost demon": "Frost-Demon",
+    "frost demon/arcosian": "Frost-Demon",
     "frieza race": "Frost-Demon",
+    "freeza race": "Frost-Demon",
     "frieza clan": "Frost-Demon",
+    "freeza clan": "Frost-Demon",
+    "changeling": "Frost-Demon",
+    "mutant arcosian": "Frost-Demon",
+    "arcosian mutant": "Frost-Demon",
+    "mutant frost demon": "Frost-Demon",
+    "frost demon mutant": "Frost-Demon",
 
     # Namekian
     "namekian": "Namekian",
     "namek": "Namekian",
     "namekian race": "Namekian",
+    "namekian warrior": "Namekian",
+    "namekian dragon clan": "Namekian",
+    "mutant namekian": "Namekian",
+    "namekian mutant": "Namekian",
 
-    # Human
+    # Humans
     "human": "Human",
     "earthling": "Human",
     "earthling human": "Human",
+    "human earthling": "Human",
+    "terran": "Human",
+    "mutant human": "Human",
+    "human mutant": "Human",
 
-    # Majin
+    # Androids / Human-Androids
+    "android": "Android",
+    "android race": "Android",
+    "human android": "Android",
+    "human/android": "Android",
+    "human (android)": "Android",
+    "android human": "Android",
+    "cyborg": "Android",
+    "artificial human": "Android",
+
+    # Majins
     "majin": "Majin",
+    "majin race": "Majin",
+    "mutant majin": "Majin",
+    "majin mutant": "Majin",
 
-    # Bio-Android
+    # Bio-Androids
     "bio android": "Bio-Android",
     "bio-android": "Bio-Android",
     "bioandroid": "Bio-Android",
-
-    # Android
-    "android": "Android",
+    "bio androids": "Bio-Android",
+    "bio-androids": "Bio-Android",
+    "biological android": "Bio-Android",
+    "bio android race": "Bio-Android",
+    "mutant bio android": "Bio-Android",
+    "bio android mutant": "Bio-Android",
 }
+
 
 
 # ============================================================
@@ -674,6 +743,7 @@ async def rebuild_approved_character_cache():
     """
 
     APPROVED_CHARACTER_CACHE.clear()
+    APPROVED_MUTANT_CACHE.clear()
 
     forum = await get_channel(
         CHARACTER_APPLICATION_FORUM_ID
@@ -744,13 +814,37 @@ async def rebuild_approved_character_cache():
         if race_tag_name is None:
             continue
 
+        user_id = starter_message.author.id
+
         APPROVED_CHARACTER_CACHE[
-            starter_message.author.id
+            user_id
         ] = race_tag_name
+
+        is_mutant = (
+            normalize(CHARACTER_MUTANT_TAG) in tag_names
+            or detect_mutant_status(
+                starter_message.content or "",
+                application
+            )
+        )
+
+        if is_mutant:
+            APPROVED_MUTANT_CACHE[user_id] = {
+                "race": race_tag_name,
+                "name": mutant_display_name(
+                    application,
+                    starter_message.author
+                ),
+            }
 
     print(
         f"🎮 Approved character cache rebuilt: "
         f"{len(APPROVED_CHARACTER_CACHE)} player(s)."
+    )
+
+    print(
+        f"🧬 Approved mutant cache rebuilt: "
+        f"{len(APPROVED_MUTANT_CACHE)} mutant(s)."
     )
 
 
@@ -769,10 +863,33 @@ def get_race_counts():
     return counts
 
 
+def get_mutant_counts():
+    """Returns Mutant characters grouped by canonical race."""
+
+    counts = {
+        race_tag: []
+        for race_tag in MUTANT_COUNT_RACES
+    }
+
+    for record in APPROVED_MUTANT_CACHE.values():
+        race_tag = record.get("race")
+        name = record.get("name") or "Unknown"
+
+        if race_tag in counts:
+            counts[race_tag].append(name)
+
+    for names in counts.values():
+        names.sort(key=str.casefold)
+
+    return counts
+
+
 def build_race_count_message():
-    """Builds the public Race Count message using accepted applications."""
+    """Builds the public Race Count + Mutant Count from Accepted apps."""
 
     counts = get_race_counts()
+    mutant_counts = get_mutant_counts()
+
     lines = [
         "## Race Count",
         "",
@@ -796,8 +913,28 @@ def build_race_count_message():
 
     lines.extend([
         "",
+        "## Mutant Count",
+        "",
+    ])
+
+    for race_tag, display_name in MUTANT_COUNT_RACES.items():
+        names = mutant_counts.get(race_tag, [])
+        count = len(names)
+
+        if names:
+            lines.append(
+                f"**{display_name}:** {count} ({', '.join(names)})"
+            )
+        else:
+            lines.append(
+                f"**{display_name}:** 0"
+            )
+
+    lines.extend([
+        "",
         "-# Automatically updated by Golden Age Manager.",
-        "-# Counts use Accepted Character Applications only.",
+        "-# Race Count uses Accepted Character Applications only.",
+        "-# Mutants are detected from the moderated Mutant forum tag, an explicit Mutant/Mutation field, or a Race/Species value containing 'Mutant'.",
     ])
 
     return "\n".join(lines)
@@ -2295,56 +2432,183 @@ def parse_mentor_application(
 
 def extract_character_race_fallback(content: str):
     """
-    Extract Race/Species from common Discord application formatting.
+    Extract Race/Species from old and new Discord application formatting.
 
-    This fallback is intentionally tolerant of Markdown such as:
-    **Race:** Namekian
-    __Race__: Saiyan
-    > Race: Arcosian
+    Supported examples include:
+      Race: Namekian
+      **Race:** Saiyan
+      __Species__: Arcosian
+      > Race - Bio-Android
+      Race = Human (Android)
+      Race: Mutant Majin
 
-    It is only used when the generic labeled-field parser did not
-    return a race value.
+    This parser only reads a labeled Race/Species field; it does not guess a
+    race from the backstory.
     """
 
     if not content:
         return None
 
-    # Prefer a Race/Species label at the beginning of a line.
-    # The pattern allows common Discord Markdown before/around the label
-    # and supports both ASCII ':' and full-width '：'.
+    label = r"(?:race|species|race\s*/\s*species|species\s*/\s*race)"
+    separator = r"(?:[:：=]|[-–—])"
+
+    # Prefer a labeled field at the start of a line. Markdown around the label
+    # and value is allowed, as are quote/list markers.
     line_pattern = re.compile(
-        r"(?im)^[\s>*#\-•|`~_]*"
-        r"(?:\*{0,2}|_{0,2})"
-        r"(?:race|species)"
-        r"(?:\*{0,2}|_{0,2})"
-        r"\s*[:：]\s*"
-        r"(?:\*{0,2}|_{0,2})?"
-        r"([^\r\n]+)"
+        rf"(?im)^[\s>*#\-•|`~_]*"
+        rf"(?:\*{{0,2}}|_{{0,2}})"
+        rf"{label}"
+        rf"(?:\*{{0,2}}|_{{0,2}})"
+        rf"\s*{separator}\s*"
+        rf"(?:\*{{0,2}}|_{{0,2}})?"
+        rf"([^\r\n]+)"
     )
 
     match = line_pattern.search(content)
 
-    # Some old applications place several fields on one line.
-    # Use a second, more permissive search if needed.
+    # Some legacy posts place several fields on one physical line.
     if match is None:
         inline_pattern = re.compile(
-            r"(?i)(?<!\w)(?:race|species)\s*[:：]\s*"
-            r"(?:\*{0,2}|_{0,2})?"
-            r"(.+?)"
-            r"(?=\s+(?:alignment|class|combat\s*role|age|sex|gender|family|alias|nickname|fighting\s*style|combat\s*style)\s*[:：]|$)"
+            rf"(?i)(?<!\w){label}\s*{separator}\s*"
+            rf"(?:\*{{0,2}}|_{{0,2}})?"
+            rf"(.+?)"
+            rf"(?=\s+(?:birth\s*name|character\s*name|name|alignment|class|"
+            rf"combat\s*role|age|sex|gender|family|alias|nickname|"
+            rf"fighting\s*style|combat\s*style|mutant(?:\s*status)?|"
+            rf"mutation(?:\s*status)?)\s*(?:[:：=]|[-–—])|$)"
         )
         match = inline_pattern.search(content.replace("\n", " "))
+
+    # Very old forms occasionally omit punctuation: "Race Namekian".
+    if match is None:
+        loose_line_pattern = re.compile(
+            rf"(?im)^[\s>*#\-•|`~_]*"
+            rf"(?:\*{{0,2}}|_{{0,2}})"
+            rf"{label}"
+            rf"(?:\*{{0,2}}|_{{0,2}})"
+            rf"\s+"
+            rf"(?:\*{{0,2}}|_{{0,2}})?"
+            rf"([^\r\n]+)"
+        )
+        match = loose_line_pattern.search(content)
 
     if match is None:
         return None
 
     value = match.group(1).strip()
-
-    # Remove trailing Markdown and obvious decoration without changing
-    # the actual race text. detect_race_tag() normalizes the rest.
     value = re.sub(r"[\s*_`~]+$", "", value).strip()
 
     return value or None
+
+
+def extract_mutant_field_fallback(content: str):
+    """Returns the explicit Mutant/Mutation field value when present."""
+
+    if not content:
+        return None
+
+    label = (
+        r"(?:is\s+(?:this\s+character\s+)?a\s+mutant\??|"
+        r"mutant(?:\s*status)?\??|"
+        r"mutation(?:\s*status|\s*type)?\??)"
+    )
+
+    pattern = re.compile(
+        rf"(?im)^[\s>*#\-•|`~_]*"
+        rf"(?:\*{{0,2}}|_{{0,2}})"
+        rf"{label}"
+        rf"(?:\*{{0,2}}|_{{0,2}})"
+        rf"\s*(?:[:：=]|[-–—])\s*"
+        rf"(?:\*{{0,2}}|_{{0,2}})?"
+        rf"([^\r\n]+)"
+    )
+
+    match = pattern.search(content)
+    if match is None:
+        return None
+
+    value = match.group(1).strip()
+    value = re.sub(r"[\s*_`~]+$", "", value).strip()
+    return value or None
+
+
+def detect_mutant_status(content: str, application: dict | None = None) -> bool:
+    """
+    Detects whether an Accepted character is explicitly marked as Mutant.
+
+    Safe signals:
+      - Race/Species contains "Mutant" (e.g. "Mutant Saiyan")
+      - A labeled Mutant/Mutation field has an affirmative/non-negative value
+
+    Backstory mentions of the word "mutant" are intentionally ignored.
+    """
+
+    application = application or {}
+
+    race_value = application.get("race") or ""
+    race_normalized = normalize(race_value)
+
+    if re.search(r"\bmutant\b", race_normalized):
+        return True
+
+    explicit_value = application.get("mutant")
+    if not explicit_value:
+        explicit_value = extract_mutant_field_fallback(content)
+
+    if not explicit_value:
+        return False
+
+    value = normalize(explicit_value)
+
+    negative_patterns = (
+        r"^no$",
+        r"^false$",
+        r"^0$",
+        r"^none$",
+        r"^n/?a$",
+        r"^not\s+a\s+mutant$",
+        r"^non[-\s]?mutant$",
+        r"^normal$",
+        r"^standard$",
+    )
+
+    if any(re.search(pattern, value) for pattern in negative_patterns):
+        return False
+
+    positive_patterns = (
+        r"^yes\b",
+        r"^true\b",
+        r"^1\b",
+        r"^y\b",
+        r"^si\b",
+        r"^sí\b",
+        r"\bmutant\b",
+        r"\bmutation\b",
+        r"^active\b",
+        r"^approved\b",
+    )
+
+    if any(re.search(pattern, value) for pattern in positive_patterns):
+        return True
+
+    # A non-empty value in a field explicitly labeled Mutant/Mutation (for
+    # example "Mutation Type: Alpha") is treated as a positive designation.
+    return True
+
+
+def mutant_display_name(application: dict, author) -> str:
+    """Returns a compact character name for the public Mutant Count."""
+
+    value = clean_value(application.get("character_name") or "")
+    value = re.sub(r"[*_`~]", "", value).strip()
+
+    if value:
+        value = value.splitlines()[0].strip()
+
+    if not value or len(value) > 40:
+        value = getattr(author, "display_name", None) or author.name
+
+    return value[:40]
 
 
 def parse_character_application(
@@ -2361,8 +2625,19 @@ def parse_character_application(
         ],
 
         "race": [
+            r"race\s*/\s*species",
+            r"species\s*/\s*race",
             r"race",
             r"species",
+        ],
+
+        "mutant": [
+            r"is\s+(?:this\s+character\s+)?a\s+mutant\??",
+            r"mutant\s*status\??",
+            r"mutation\s*status\??",
+            r"mutation\s*type\??",
+            r"mutant\??",
+            r"mutation\??",
         ],
 
         "alias": [
@@ -3239,10 +3514,32 @@ async def handle_character_application(
         and accepted_normalized not in after_tags
     )
 
+    mutant_normalized = normalize(
+        CHARACTER_MUTANT_TAG
+    )
+
+    mutant_changed = (
+        (mutant_normalized in before_tags)
+        != (mutant_normalized in after_tags)
+    )
+
     if accepted_removed:
         await rebuild_approved_character_cache()
         await update_race_count_message(
             reason="Accepted tag removed"
+        )
+
+    # Mutant can be a separate moderated forum tag. Staff may add/remove it
+    # after a character was already accepted, so refresh the public count
+    # immediately without forcing Accepted to be toggled again.
+    if (
+        mutant_changed
+        and accepted_normalized in after_tags
+        and accepted_normalized not in newly_added
+    ):
+        await rebuild_approved_character_cache()
+        await update_race_count_message(
+            reason="Mutant tag changed"
         )
 
     if not newly_added:
@@ -3477,10 +3774,14 @@ async def handle_character_application(
                 "Please make sure the application "
                 "contains a field such as:\n"
                 "`Race: Saiyan`\n"
+                "`Race: Human`\n"
+                "`Race: Human (Android)`\n"
                 "`Race: Namekian`\n"
                 "`Race: Arcosian`\n"
+                "`Race: Bio-Android`\n"
                 "`Race: Majin`\n"
-                "etc.\n\n"
+                "Mutants can use formats such as "
+                "`Race: Mutant Saiyan` or `Mutant: Yes`.\n\n"
                 "The application was **not "
                 "published or archived**."
             )
