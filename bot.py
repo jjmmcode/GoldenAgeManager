@@ -81,7 +81,7 @@ MENTOR_ABILITY_CATALOG = {
         "Ki Barrage",
         # Kienzan + Kienzan Doble share ONE mentor slot.
         # A mentor must know both techniques to occupy this slot.
-        "Kienzan + Kienzan Doble",
+        "Kienzan + Double Kienzan",
         "Makkanko",
         "Masenko",
         "Sokidan",
