@@ -56,6 +56,12 @@ MENTOR_LIST_CHANNEL_ID = 1543938120301551626
 APPROVED_MENTOR_RECORDS = {}
 MENTOR_LIST_LOCK = asyncio.Lock()
 
+# Public catalogue of abilities that are currently teachable. It uses the
+# same authoritative Mentor Application records as the Mentor List, but
+# deduplicates abilities and groups them by mentorship type.
+AVAILABLE_ABILITIES_CHANNEL_ID = MENTOR_LIST_CHANNEL_ID
+AVAILABLE_ABILITIES_LOCK = asyncio.Lock()
+
 
 # ------------------------------------------------------------
 # CHARACTER SYSTEM
@@ -3366,6 +3372,175 @@ async def update_mentor_list_message(reason: str = "automatic update"):
             return False
 
 
+
+# ============================================================
+# AVAILABLE ABILITIES DIRECTORY
+# ============================================================
+
+def build_available_abilities_message():
+    """Build a unique, alphabetized catalogue of currently teachable abilities."""
+
+    grouped = {
+        "Technique": {},
+        "Custom-Form": {},
+        "Passive-Skill": {},
+    }
+
+    for record in APPROVED_MENTOR_RECORDS.values():
+        mentor_type = record.get("type")
+        if mentor_type not in grouped:
+            continue
+
+        ability = _clean_mentor_skill_name(
+            record.get("skill"),
+            record.get("thread_name"),
+        )
+
+        if not ability or normalize(ability) == normalize("Unknown Skill"):
+            continue
+
+        # Preserve the first human-friendly capitalization while deduplicating
+        # case-insensitively (e.g. "Kaioken" and "kaioken" become one entry).
+        grouped[mentor_type].setdefault(ability.casefold(), ability)
+
+    sections = [
+        ("Technique", "### 🎯 Techniques"),
+        ("Custom-Form", "### 🧬 Custom Forms"),
+        ("Passive-Skill", "### ✨ Passive Skills"),
+    ]
+
+    lines = [
+        "## 📚 Available Abilities",
+        "",
+    ]
+
+    has_any = False
+
+    for mentor_type, heading in sections:
+        lines.append(heading)
+
+        abilities = sorted(
+            grouped[mentor_type].values(),
+            key=str.casefold,
+        )
+
+        if abilities:
+            has_any = True
+            lines.extend(
+                f"• {ability}"
+                for ability in abilities
+            )
+        else:
+            lines.append("• None currently available.")
+
+        lines.append("")
+
+    if not has_any:
+        lines.append(
+            "-# No Mentor Applications are currently approved."
+        )
+    else:
+        lines.append(
+            "-# Automatically updated from currently approved Mentor Applications."
+        )
+
+    content = "\n".join(lines).rstrip()
+
+    if len(content) > 1990:
+        content = content[:1900].rstrip() + (
+            "\n\n-# Available Abilities list truncated because it exceeded Discord's message limit."
+        )
+
+    return content
+
+
+async def get_available_abilities_message(channel: discord.TextChannel):
+    """Find Golden Age Manager's managed Available Abilities message."""
+
+    meta = PROCESSED_APPLICATIONS.setdefault("meta", {})
+    stored_message_id = meta.get("available_abilities_message_id")
+
+    if stored_message_id:
+        try:
+            message = await channel.fetch_message(int(stored_message_id))
+            if message.author.id == client.user.id:
+                return message
+        except (
+            discord.NotFound,
+            discord.Forbidden,
+            discord.HTTPException,
+            ValueError,
+            TypeError,
+        ):
+            pass
+
+    try:
+        async for message in channel.history(limit=100):
+            if (
+                message.author.id == client.user.id
+                and "## 📚 Available Abilities" in (message.content or "")
+                and "Automatically updated" in (message.content or "")
+            ):
+                meta["available_abilities_message_id"] = message.id
+                save_processed_applications()
+                return message
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+
+    return None
+
+
+async def update_available_abilities_message(reason: str = "automatic update"):
+    """Create or edit the managed Available Abilities catalogue in #information."""
+
+    async with AVAILABLE_ABILITIES_LOCK:
+        channel = await get_channel(AVAILABLE_ABILITIES_CHANNEL_ID)
+
+        if not isinstance(channel, discord.TextChannel):
+            print(
+                "⚠️ Available Abilities channel was not found or is not a text channel."
+            )
+            return False
+
+        content = build_available_abilities_message()
+        message = await get_available_abilities_message(channel)
+
+        try:
+            if message is None:
+                message = await channel.send(content)
+                PROCESSED_APPLICATIONS.setdefault(
+                    "meta", {}
+                )["available_abilities_message_id"] = message.id
+                save_processed_applications()
+                print(
+                    f"📚 Available Abilities message created in #{channel.name}."
+                )
+            elif message.content != content:
+                await message.edit(content=content)
+                print(
+                    f"📚 Available Abilities updated ({reason})."
+                )
+            else:
+                print(
+                    f"📚 Available Abilities already current ({reason})."
+                )
+
+            return True
+
+        except discord.Forbidden:
+            print(
+                "❌ Golden Age Manager cannot create/edit Available Abilities. "
+                "Check View Channel, Send Messages and Read Message History."
+            )
+            return False
+
+        except discord.HTTPException as error:
+            print(
+                f"❌ Discord API error while updating Available Abilities: {error}"
+            )
+            return False
+
+
 # ============================================================
 # CHARACTER PARSER
 # ============================================================
@@ -3827,6 +4002,7 @@ async def on_ready():
     if not INITIAL_ACCESS_SYNC_DONE:
         await rebuild_approved_mentor_records()
         await update_mentor_list_message(reason="startup")
+        await update_available_abilities_message(reason="startup")
         await rebuild_approved_character_cache()
         await rebuild_approved_mutant_cache()
         await reconcile_accepted_mutant_applications()
@@ -4105,6 +4281,9 @@ async def handle_mentor_application(
         await update_mentor_list_message(
             reason="mentor approval tag removed"
         )
+        await update_available_abilities_message(
+            reason="mentor approval tag removed"
+        )
 
         if not newly_added:
             return
@@ -4128,6 +4307,9 @@ async def handle_mentor_application(
 
         await rebuild_approved_mentor_records()
         await update_mentor_list_message(
+            reason="mentor application rejected"
+        )
+        await update_available_abilities_message(
             reason="mentor application rejected"
         )
 
@@ -4182,6 +4364,9 @@ async def handle_mentor_application(
         if destination_exists:
             await rebuild_approved_mentor_records()
             await update_mentor_list_message(
+                reason="mentor approval tag restored"
+            )
+            await update_available_abilities_message(
                 reason="mentor approval tag restored"
             )
 
@@ -4474,6 +4659,9 @@ async def handle_mentor_application(
 
         await rebuild_approved_mentor_records()
         await update_mentor_list_message(
+            reason="mentor approved"
+        )
+        await update_available_abilities_message(
             reason="mentor approved"
         )
 
