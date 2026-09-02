@@ -56,11 +56,95 @@ MENTOR_LIST_CHANNEL_ID = 1543938120301551626
 APPROVED_MENTOR_RECORDS = {}
 MENTOR_LIST_LOCK = asyncio.Lock()
 
-# Public catalogue of abilities that are currently teachable. It uses the
-# same authoritative Mentor Application records as the Mentor List, but
-# deduplicates abilities and groups them by mentorship type.
+# Public catalogue of mentor slots that are still open. Unlike the Mentor
+# List, this is NOT built from approved applications. It starts from a fixed
+# whitelist of abilities that Staff allows people to apply for, then removes
+# any ability that already has an approved mentor.
 AVAILABLE_ABILITIES_CHANNEL_ID = MENTOR_LIST_CHANNEL_ID
 AVAILABLE_ABILITIES_LOCK = asyncio.Lock()
+
+# Source-of-truth catalogue for OPEN mentor applications.
+# Custom Forms / Passive Skills stay empty until Staff provides their lists;
+# empty categories are omitted from the public message instead of inventing
+# availability from already-approved Mentor Applications.
+MENTOR_ABILITY_CATALOG = {
+    "Technique": [
+        "Big Bang",
+        "Burning Attack",
+        "Death Beam",
+        "Emperor Death Beam",
+        "Fake Moon",
+        "Final Explosion",
+        "Final Flash",
+        "Galick Gun",
+        "Kamehameha",
+        "Ki Barrage",
+        # Kienzan + Kienzan Doble share ONE mentor slot.
+        # A mentor must know both techniques to occupy this slot.
+        "Kienzan + Kienzan Doble",
+        "Makkanko",
+        "Masenko",
+        "Sokidan",
+        "Soul Punisher",
+        "Spirit Bomb",
+        "Supernova",
+        "Supernova Cooler",
+    ],
+    "Custom-Form": [],
+    "Passive-Skill": [],
+}
+
+# Common wording variants accepted when matching an approved application to
+# the catalogue. The values must be exact names from MENTOR_ABILITY_CATALOG.
+MENTOR_ABILITY_ALIASES = {
+    "big bang": "Big Bang",
+    "big bang attack": "Big Bang",
+    "burning attack": "Burning Attack",
+    "death beam": "Death Beam",
+    "emperor death beam": "Emperor Death Beam",
+    "emperor's death beam": "Emperor Death Beam",
+    "fake moon": "Fake Moon",
+    "power ball": "Fake Moon",
+    "final explosion": "Final Explosion",
+    "final flash": "Final Flash",
+    "galick gun": "Galick Gun",
+    "galick gun attack": "Galick Gun",
+    "kamehameha": "Kamehameha",
+    "ki barrage": "Ki Barrage",
+    # Kienzan is intentionally NOT mapped individually here.
+    # It is a paired mentor slot with Kienzan Doble and is validated below.
+    "makkanko": "Makkanko",
+    "makankosappo": "Makkanko",
+    "special beam cannon": "Makkanko",
+    "masenko": "Masenko",
+    "sokidan": "Sokidan",
+    "spirit ball": "Sokidan",
+    "soul punisher": "Soul Punisher",
+    "spirit bomb": "Spirit Bomb",
+    "spiritbomb": "Spirit Bomb",
+    "genki dama": "Spirit Bomb",
+    "supernova": "Supernova",
+    "supernova cooler": "Supernova Cooler",
+    "cooler supernova": "Supernova Cooler",
+}
+
+
+# Kienzan mentorship is a paired requirement: one mentor owns both techniques.
+KIENZAN_BUNDLE_CATALOG_NAME = "Kienzan + Kienzan Doble"
+KIENZAN_SINGLE_NAMES = (
+    "kienzan",
+    "destructo disc",
+    "destructo disk",
+)
+KIENZAN_DOUBLE_NAMES = (
+    "kienzan doble",
+    "kienzan double",
+    "double kienzan",
+    "double destructo disc",
+    "double destructo disk",
+    "destructo disc double",
+    "destructo disk double",
+)
 
 
 # ------------------------------------------------------------
@@ -3176,33 +3260,112 @@ async def rebuild_approved_mentor_records():
 
 
 def _clean_mentor_skill_name(skill: str, thread_name: str) -> str:
-    """Return a short, human-friendly skill/form/passive name."""
+    """Return only the actual teachable ability/form/passive name.
 
-    value = str(skill or "").strip()
+    Mentor applications in the server come from several generations of forms.
+    Older posts may use titles such as ``Mentor of Ki manipulation`` or values
+    such as ``Kaioken (Single Form / Multiplier Skill)``. The public Mentor
+    List and Available Abilities directory should show the ability itself, not
+    form labels or application wording.
+    """
 
-    # A legacy parser could previously capture a large chunk of an
-    # application. If that happens, prefer the approved thread title.
-    if (
-        not value
-        or len(value) > 120
-        or "\n" in value
-        or "ability description" in normalize(value)
-        or "migration accepted" in normalize(value)
-    ):
-        value = str(thread_name or "Unknown Skill").strip()
+    def clean_candidate(raw: str) -> str:
+        value = str(raw or "").strip()
+        if not value:
+            return ""
 
-    # Clean common legacy approved-thread titles so the public directory reads
-    # as a simple list of what each mentor can actually teach.
-    cleanups = [
-        (r"^mentor\s+of\s+the\s+", ""),
-        (r"^mentor\s+for\s+", ""),
-        (r"\s+mentor$", ""),
-        (r"\s+and\s+dojo\s+master(?:\s*\|.*)?$", ""),
-        (r"\s*\|\s*[^|]+$", ""),
-    ]
+        value = re.sub(r"[*_`~]", "", value).strip()
 
-    for pattern, repl in cleanups:
-        value = re.sub(pattern, repl, value, flags=re.IGNORECASE).strip()
+        normalized_value = normalize(value)
+        bad_markers = (
+            "ability description",
+            "migration accepted",
+            "in-character justification",
+            "in character justification",
+            "mentor reasoning",
+            "mentor background",
+            "lore reason",
+        )
+        if (
+            len(value) > 120
+            or "\n" in value
+            or any(marker in normalized_value for marker in bad_markers)
+        ):
+            return ""
+
+        value = re.sub(
+            r"^(?:ability\s+to\s+mentor|skill\s+i\s+want\s+to\s+mentor|"
+            r"mentor\s+ability|mentor\s+skill|ability|skill|technique|"
+            r"custom\s+form|passive\s+skill)\s*[:\-–—]\s*",
+            "",
+            value,
+            flags=re.IGNORECASE,
+        ).strip()
+
+        prefix_patterns = (
+            r"^mentor\s+of\s+the\s+",
+            r"^mentor\s+of\s+",
+            r"^mentor\s+for\s+",
+            r"^mentor\s*[:\-–—]\s*",
+        )
+        for prefix in prefix_patterns:
+            value = re.sub(prefix, "", value, flags=re.IGNORECASE).strip()
+
+        suffix_patterns = (
+            r"\s+mentor$",
+            r"\s+and\s+dojo\s+master(?:\s*\|.*)?$",
+            r"\s*\|\s*[^|]+$",
+        )
+        for suffix in suffix_patterns:
+            value = re.sub(suffix, "", value, flags=re.IGNORECASE).strip()
+
+        value = re.sub(
+            r"\s*\((?:single\s+form|multiplier\s+skill|single\s+form\s*/\s*"
+            r"multiplier\s+skill|technique|custom\s+form|passive\s+skill|"
+            r"mentor(?:ship)?)\)\s*$",
+            "",
+            value,
+            flags=re.IGNORECASE,
+        ).strip()
+
+        value = re.sub(r"\s+", " ", value).strip(" -–—|:;")
+
+        canonical_patterns = {
+            r"^ki\s+manipulation$": "Ki Manipulation",
+            r"^ki\s+protection$": "Ki Protection",
+            r"^ki\s+amplification$": "Ki Amplification",
+            r"^kaioken$": "Kaioken",
+            r"^instant\s+transmission$": "Instant Transmission",
+            r"^healing\s+reduction$": "Healing Reduction",
+            r"^solar\s+flare$": "Solar Flare",
+            r"^fusion$": "Fusion",
+            r"^true\s+potential\s+unleashed$": "True Potential Unleashed",
+        }
+        for canonical_pattern, canonical_name in canonical_patterns.items():
+            if re.fullmatch(canonical_pattern, value, flags=re.IGNORECASE):
+                return canonical_name
+
+        return value
+
+    skill_value = clean_candidate(skill)
+    thread_value = clean_candidate(thread_name)
+    value = skill_value or thread_value or "Unknown Skill"
+
+    if skill_value and thread_value:
+        skill_norm = normalize(skill_value)
+        thread_norm = normalize(thread_value)
+        if (
+            skill_norm == thread_norm
+            or skill_norm.startswith(thread_norm + " ")
+            or thread_norm.startswith(skill_norm + " ")
+        ):
+            value = min(
+                (skill_value, thread_value),
+                key=lambda item: (len(item), item.casefold()),
+            )
+
+    if _kienzan_bundle_status(value)[1]:
+        return KIENZAN_BUNDLE_CATALOG_NAME
 
     return value or "Unknown Skill"
 
@@ -3377,31 +3540,132 @@ async def update_mentor_list_message(reason: str = "automatic update"):
 # AVAILABLE ABILITIES DIRECTORY
 # ============================================================
 
-def build_available_abilities_message():
-    """Build a unique, alphabetized catalogue of currently teachable abilities."""
+def _mentor_ability_match_key(value: str) -> str:
+    """Normalize an ability name for catalogue/approval matching."""
 
-    grouped = {
-        "Technique": {},
-        "Custom-Form": {},
-        "Passive-Skill": {},
+    value = str(value or "").replace("_", " ").replace("-", " ")
+    value = value.casefold()
+    value = re.sub(r"[^a-z0-9']+", " ", value)
+    value = re.sub(r"\s+", " ", value).strip()
+    return value
+
+
+def _kienzan_bundle_status(value: str):
+    """Return (mentions_kienzan_family, has_required_pair).
+
+    A valid Kienzan mentor application must explicitly cover BOTH the normal
+    Kienzan/Destructo Disc and the double variant.
+    """
+
+    key = _mentor_ability_match_key(value)
+    if not key:
+        return False, False
+
+    double_match = next(
+        (name for name in KIENZAN_DOUBLE_NAMES if name in key),
+        None,
+    )
+
+    remainder = key
+    for name in KIENZAN_DOUBLE_NAMES:
+        remainder = remainder.replace(name, " ")
+    remainder = re.sub(r"\s+", " ", remainder).strip()
+
+    single_match = any(
+        re.search(rf"(?<![a-z0-9]){re.escape(name)}(?![a-z0-9])", remainder)
+        for name in KIENZAN_SINGLE_NAMES
+    )
+
+    mentions_family = bool(double_match) or any(
+        name in key for name in KIENZAN_SINGLE_NAMES
+    )
+    has_pair = bool(double_match) and bool(single_match)
+
+    return mentions_family, has_pair
+
+
+def _mentor_bundle_requirement_error(skill: str, mentor_type: str):
+    """Return an error message when a paired mentor slot is incomplete."""
+
+    if mentor_type != "Technique":
+        return None
+
+    mentions_family, has_pair = _kienzan_bundle_status(skill)
+    if mentions_family and not has_pair:
+        return (
+            "Kienzan and Kienzan Doble are a **single combined mentor slot**. "
+            "The same mentor must know and apply for **both techniques**. "
+            "Update the ability field to explicitly include "
+            "`Kienzan + Kienzan Doble` before approving this application."
+        )
+
+    return None
+
+
+def _canonical_catalog_ability(ability: str, mentor_type: str):
+    """Return the exact catalogue name if an approved skill occupies a slot."""
+
+    key = _mentor_ability_match_key(ability)
+    if not key:
+        return None
+
+    # Kienzan + Kienzan Doble occupy one mentor slot and only count as occupied
+    # when the approved application explicitly covers both techniques.
+    if mentor_type == "Technique":
+        mentions_kienzan, has_kienzan_pair = _kienzan_bundle_status(ability)
+        if has_kienzan_pair:
+            return KIENZAN_BUNDLE_CATALOG_NAME
+        if mentions_kienzan:
+            return None
+
+    # First resolve known aliases such as "Big Bang Attack" -> "Big Bang".
+    alias_target = MENTOR_ABILITY_ALIASES.get(key)
+    if alias_target and alias_target in MENTOR_ABILITY_CATALOG.get(mentor_type, []):
+        return alias_target
+
+    # Then compare directly against the configured catalogue names.
+    for catalogue_name in MENTOR_ABILITY_CATALOG.get(mentor_type, []):
+        if key == _mentor_ability_match_key(catalogue_name):
+            return catalogue_name
+
+    return None
+
+
+def build_available_abilities_message():
+    """Show only mentor abilities whose application slot is still OPEN.
+
+    Formula:
+        configured mentor catalogue - currently approved mentor abilities
+        = abilities someone may still apply to mentor.
+
+    Approved skills outside the configured catalogue are intentionally ignored;
+    they belong in Mentor List but do not consume one of these whitelist slots.
+    """
+
+    occupied = {
+        mentor_type: set()
+        for mentor_type in MENTOR_ABILITY_CATALOG
     }
 
     for record in APPROVED_MENTOR_RECORDS.values():
         mentor_type = record.get("type")
-        if mentor_type not in grouped:
+        if mentor_type not in occupied:
             continue
 
-        ability = _clean_mentor_skill_name(
+        approved_ability = _clean_mentor_skill_name(
             record.get("skill"),
             record.get("thread_name"),
         )
 
-        if not ability or normalize(ability) == normalize("Unknown Skill"):
-            continue
+        catalogue_name = _canonical_catalog_ability(
+            approved_ability,
+            mentor_type,
+        )
 
-        # Preserve the first human-friendly capitalization while deduplicating
-        # case-insensitively (e.g. "Kaioken" and "kaioken" become one entry).
-        grouped[mentor_type].setdefault(ability.casefold(), ability)
+        if catalogue_name:
+            occupied[mentor_type].add(
+                _mentor_ability_match_key(catalogue_name)
+            )
 
     sections = [
         ("Technique", "### 🎯 Techniques"),
@@ -3410,45 +3674,59 @@ def build_available_abilities_message():
     ]
 
     lines = [
-        "## 📚 Available Abilities",
+        "## 📚 Available Mentor Abilities",
+        "",
+        "These are the abilities that **currently have no approved mentor** and are open for Mentor Applications.",
+        "",
+        "-# Kienzan + Kienzan Doble share one mentor slot; the same mentor must know both techniques.",
         "",
     ]
 
-    has_any = False
+    configured_any = False
+    available_total = 0
 
     for mentor_type, heading in sections:
+        catalogue = MENTOR_ABILITY_CATALOG.get(mentor_type, [])
+
+        # Staff has not supplied a catalogue for this category yet, so do not
+        # pretend that approved abilities define what is available.
+        if not catalogue:
+            continue
+
+        configured_any = True
         lines.append(heading)
 
-        abilities = sorted(
-            grouped[mentor_type].values(),
-            key=str.casefold,
-        )
+        available = [
+            ability
+            for ability in catalogue
+            if _mentor_ability_match_key(ability) not in occupied[mentor_type]
+        ]
+        available = sorted(available, key=str.casefold)
+        available_total += len(available)
 
-        if abilities:
-            has_any = True
+        if available:
             lines.extend(
                 f"• {ability}"
-                for ability in abilities
+                for ability in available
             )
         else:
-            lines.append("• None currently available.")
+            lines.append("• **No mentor slots currently available.**")
 
         lines.append("")
 
-    if not has_any:
-        lines.append(
-            "-# No Mentor Applications are currently approved."
-        )
+    if not configured_any:
+        lines.append("• No mentor ability catalogue has been configured yet.")
     else:
         lines.append(
-            "-# Automatically updated from currently approved Mentor Applications."
+            f"-# {available_total} mentor slot(s) currently available. "
+            "Automatically updated when Mentor Applications are approved, removed, or restored."
         )
 
     content = "\n".join(lines).rstrip()
 
     if len(content) > 1990:
         content = content[:1900].rstrip() + (
-            "\n\n-# Available Abilities list truncated because it exceeded Discord's message limit."
+            "\n\n-# Available Mentor Abilities list truncated because it exceeded Discord's message limit."
         )
 
     return content
@@ -3478,7 +3756,10 @@ async def get_available_abilities_message(channel: discord.TextChannel):
         async for message in channel.history(limit=100):
             if (
                 message.author.id == client.user.id
-                and "## 📚 Available Abilities" in (message.content or "")
+                and (
+                    "## 📚 Available Mentor Abilities" in (message.content or "")
+                    or "## 📚 Available Abilities" in (message.content or "")
+                )
                 and "Automatically updated" in (message.content or "")
             ):
                 meta["available_abilities_message_id"] = message.id
@@ -3491,7 +3772,7 @@ async def get_available_abilities_message(channel: discord.TextChannel):
 
 
 async def update_available_abilities_message(reason: str = "automatic update"):
-    """Create or edit the managed Available Abilities catalogue in #information."""
+    """Create or edit the managed open Mentor Abilities catalogue in #information."""
 
     async with AVAILABLE_ABILITIES_LOCK:
         channel = await get_channel(AVAILABLE_ABILITIES_CHANNEL_ID)
@@ -4343,6 +4624,79 @@ async def handle_mentor_application(
             break
 
     if selected_source_tag is None:
+        return
+
+
+    # --------------------------------------------------------
+    # PAIRED TECHNIQUE REQUIREMENT
+    # --------------------------------------------------------
+    # Kienzan and Kienzan Doble cannot be approved as separate mentor slots.
+    # If Staff attempts to approve only one, remove the approval tag and leave
+    # the application open so it can be corrected.
+    validation_starter = await get_starter_message(after)
+    if validation_starter is None:
+        print("❌ Starter message not found for mentor bundle validation.")
+        return
+
+    validation_application = parse_mentor_application(
+        validation_starter.content or ""
+    )
+    validation_skill = (
+        validation_application.get("skill")
+        or after.name
+        or ""
+    )
+
+    bundle_error = _mentor_bundle_requirement_error(
+        validation_skill,
+        destination_tag_name,
+    )
+
+    if bundle_error:
+        try:
+            selected_normalized = normalize(selected_source_tag)
+            remaining_tags = [
+                tag
+                for tag in after.applied_tags
+                if normalize(tag.name) != selected_normalized
+            ]
+
+            await after.edit(
+                applied_tags=remaining_tags,
+                reason=(
+                    "Golden Age Manager: incomplete Kienzan mentor bundle"
+                ),
+            )
+
+            await after.send(
+                "## ⚠️ Mentor Bundle Requirement\n\n"
+                f"{bundle_error}\n\n"
+                "The approval tag was removed automatically. "
+                "The application was **not published or archived**."
+            )
+
+            print(
+                f"⚠️ Mentor approval blocked for '{after.name}': "
+                "Kienzan + Kienzan Doble must be mentored together."
+            )
+
+        except discord.Forbidden:
+            print(
+                "❌ Could not remove the mentor approval tag after the "
+                "Kienzan bundle validation failed. Check Manage Threads."
+            )
+        except discord.HTTPException as error:
+            print(
+                f"❌ Discord API error while enforcing Kienzan bundle: {error}"
+            )
+
+        await rebuild_approved_mentor_records()
+        await update_mentor_list_message(
+            reason="incomplete Kienzan bundle blocked"
+        )
+        await update_available_abilities_message(
+            reason="incomplete Kienzan bundle blocked"
+        )
         return
 
 
