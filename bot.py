@@ -81,7 +81,7 @@ MENTOR_ABILITY_CATALOG = {
         "Ki Barrage",
         # Kienzan + Kienzan Doble share ONE mentor slot.
         # A mentor must know both techniques to occupy this slot.
-        "Kienzan + Double Kienzan",
+        "Kienzan + Kienzan Doble",
         "Makkanko",
         "Masenko",
         "Sokidan",
@@ -205,6 +205,7 @@ CHARACTER_RACE_ROLE_IDS = {
     "Android": 1543930046681448560,
     "Majin": 1543930112037232730,
     "Bio-Android": 1543930297257693326,
+    "Tuffle": 1544872038534226021,
 }
 
 # Cache used for Discord access restoration.
@@ -247,10 +248,12 @@ RACE_COUNT_LIMITS = {
     "Frost-Demon": ("Arcosian", 10),
     "Bio-Android": ("Bio-Android", 10),
     "Majin": ("Majin", 10),
+    "Tuffle": ("Tuffle", 5),
 }
 
 # Mutant Count follows the categories used in #information.
 # Android is intentionally not a separate mutant category.
+# Tuffle is not added here yet: this version only adds Tuffle as a main race.
 MUTANT_COUNT_RACES = {
     "Saiyan": "Saiyan",
     "Human": "Human",
@@ -373,6 +376,16 @@ RACE_MAPPING = {
     "bio android race": "Bio-Android",
     "mutant bio android": "Bio-Android",
     "bio android mutant": "Bio-Android",
+
+    # Tuffles / Tsufuru
+    "tuffle": "Tuffle",
+    "tuffles": "Tuffle",
+    "tuffle race": "Tuffle",
+    "tsufuru": "Tuffle",
+    "tsufurujin": "Tuffle",
+    "tsufru": "Tuffle",
+    "tsufruian": "Tuffle",
+    "tsufurian": "Tuffle",
 }
 
 
@@ -5325,6 +5338,7 @@ async def handle_character_application(
                 "`Race: Arcosian`\n"
                 "`Race: Bio-Android`\n"
                 "`Race: Majin`\n"
+                "`Race: Tuffle`\n"
                 "Mutants can use formats such as "
                 "`Race: Mutant Saiyan` or `Mutant: Yes`.\n\n"
                 "The application was **not "
