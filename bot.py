@@ -71,8 +71,9 @@ MENTOR_ABILITY_CATALOG = {
     "Technique": [
         "Big Bang",
         "Burning Attack",
-        "Death Beam",
-        "Emperor Death Beam",
+        # Death Beam + Emperor Death Beam share ONE mentor slot.
+        # A mentor must know both techniques to occupy this slot.
+        "Death Beam + Emperor Death Beam",
         "Fake Moon",
         "Final Explosion",
         "Final Flash",
@@ -100,9 +101,8 @@ MENTOR_ABILITY_ALIASES = {
     "big bang": "Big Bang",
     "big bang attack": "Big Bang",
     "burning attack": "Burning Attack",
-    "death beam": "Death Beam",
-    "emperor death beam": "Emperor Death Beam",
-    "emperor's death beam": "Emperor Death Beam",
+    # Death Beam is intentionally NOT mapped individually here.
+    # It is a paired mentor slot with Emperor Death Beam and is validated below.
     "fake moon": "Fake Moon",
     "power ball": "Fake Moon",
     "final explosion": "Final Explosion",
@@ -144,6 +144,17 @@ KIENZAN_DOUBLE_NAMES = (
     "double destructo disk",
     "destructo disc double",
     "destructo disk double",
+)
+
+# Death Beam mentorship is also paired: one mentor owns both techniques.
+DEATH_BEAM_BUNDLE_CATALOG_NAME = "Death Beam + Emperor Death Beam"
+DEATH_BEAM_SINGLE_NAMES = (
+    "death beam",
+)
+EMPEROR_DEATH_BEAM_NAMES = (
+    "emperor death beam",
+    "emperor's death beam",
+    "emperors death beam",
 )
 
 
@@ -3380,6 +3391,9 @@ def _clean_mentor_skill_name(skill: str, thread_name: str) -> str:
     if _kienzan_bundle_status(value)[1]:
         return KIENZAN_BUNDLE_CATALOG_NAME
 
+    if _death_beam_bundle_status(value)[1]:
+        return DEATH_BEAM_BUNDLE_CATALOG_NAME
+
     return value or "Unknown Skill"
 
 
@@ -3597,6 +3611,44 @@ def _kienzan_bundle_status(value: str):
     return mentions_family, has_pair
 
 
+def _death_beam_bundle_status(value: str):
+    """Return (mentions_death_beam_family, has_required_pair).
+
+    A valid Death Beam mentor application must explicitly cover BOTH the normal
+    Death Beam and Emperor Death Beam. Emperor Death Beam alone does not count
+    as both just because its name contains the words "Death Beam".
+    """
+
+    key = _mentor_ability_match_key(value)
+    if not key:
+        return False, False
+
+    emperor_match = next(
+        (name for name in EMPEROR_DEATH_BEAM_NAMES if name in key),
+        None,
+    )
+
+    # Remove the Emperor variant before checking for the standalone Death Beam.
+    # This prevents "Emperor Death Beam" from satisfying both requirements.
+    remainder = key
+    for name in EMPEROR_DEATH_BEAM_NAMES:
+        remainder = remainder.replace(name, " ")
+    remainder = re.sub(r"\s+", " ", remainder).strip()
+
+    single_match = any(
+        re.search(rf"(?<![a-z0-9]){re.escape(name)}(?![a-z0-9])", remainder)
+        for name in DEATH_BEAM_SINGLE_NAMES
+    )
+
+    mentions_family = bool(emperor_match) or any(
+        re.search(rf"(?<![a-z0-9]){re.escape(name)}(?![a-z0-9])", key)
+        for name in DEATH_BEAM_SINGLE_NAMES
+    )
+    has_pair = bool(emperor_match) and bool(single_match)
+
+    return mentions_family, has_pair
+
+
 def _mentor_bundle_requirement_error(skill: str, mentor_type: str):
     """Return an error message when a paired mentor slot is incomplete."""
 
@@ -3612,6 +3664,15 @@ def _mentor_bundle_requirement_error(skill: str, mentor_type: str):
             "`Kienzan + Kienzan Doble` before approving this application."
         )
 
+    mentions_family, has_pair = _death_beam_bundle_status(skill)
+    if mentions_family and not has_pair:
+        return (
+            "Death Beam and Emperor Death Beam are a **single combined mentor slot**. "
+            "The same mentor must know and apply for **both techniques**. "
+            "Update the ability field to explicitly include "
+            "`Death Beam + Emperor Death Beam` before approving this application."
+        )
+
     return None
 
 
@@ -3622,13 +3683,19 @@ def _canonical_catalog_ability(ability: str, mentor_type: str):
     if not key:
         return None
 
-    # Kienzan + Kienzan Doble occupy one mentor slot and only count as occupied
-    # when the approved application explicitly covers both techniques.
+    # Paired techniques occupy one mentor slot and only count as occupied when
+    # the approved application explicitly covers BOTH techniques in the pair.
     if mentor_type == "Technique":
         mentions_kienzan, has_kienzan_pair = _kienzan_bundle_status(ability)
         if has_kienzan_pair:
             return KIENZAN_BUNDLE_CATALOG_NAME
         if mentions_kienzan:
+            return None
+
+        mentions_death_beam, has_death_beam_pair = _death_beam_bundle_status(ability)
+        if has_death_beam_pair:
+            return DEATH_BEAM_BUNDLE_CATALOG_NAME
+        if mentions_death_beam:
             return None
 
     # First resolve known aliases such as "Big Bang Attack" -> "Big Bang".
@@ -3692,6 +3759,7 @@ def build_available_abilities_message():
         "These are the abilities that **currently have no approved mentor** and are open for Mentor Applications.",
         "",
         "-# Kienzan + Kienzan Doble share one mentor slot; the same mentor must know both techniques.",
+        "-# Death Beam + Emperor Death Beam share one mentor slot; the same mentor must know both techniques.",
         "",
     ]
 
@@ -4643,9 +4711,9 @@ async def handle_mentor_application(
     # --------------------------------------------------------
     # PAIRED TECHNIQUE REQUIREMENT
     # --------------------------------------------------------
-    # Kienzan and Kienzan Doble cannot be approved as separate mentor slots.
-    # If Staff attempts to approve only one, remove the approval tag and leave
-    # the application open so it can be corrected.
+    # Some techniques are bundled into one mentor slot. If Staff attempts to
+    # approve only one technique from a required pair, remove the approval tag
+    # and leave the application open so it can be corrected.
     validation_starter = await get_starter_message(after)
     if validation_starter is None:
         print("❌ Starter message not found for mentor bundle validation.")
@@ -4677,7 +4745,7 @@ async def handle_mentor_application(
             await after.edit(
                 applied_tags=remaining_tags,
                 reason=(
-                    "Golden Age Manager: incomplete Kienzan mentor bundle"
+                    "Golden Age Manager: incomplete paired mentor bundle"
                 ),
             )
 
@@ -4690,25 +4758,25 @@ async def handle_mentor_application(
 
             print(
                 f"⚠️ Mentor approval blocked for '{after.name}': "
-                "Kienzan + Kienzan Doble must be mentored together."
+                "paired technique bundle requirement not met."
             )
 
         except discord.Forbidden:
             print(
                 "❌ Could not remove the mentor approval tag after the "
-                "Kienzan bundle validation failed. Check Manage Threads."
+                "paired mentor bundle validation failed. Check Manage Threads."
             )
         except discord.HTTPException as error:
             print(
-                f"❌ Discord API error while enforcing Kienzan bundle: {error}"
+                f"❌ Discord API error while enforcing paired mentor bundle: {error}"
             )
 
         await rebuild_approved_mentor_records()
         await update_mentor_list_message(
-            reason="incomplete Kienzan bundle blocked"
+            reason="incomplete paired mentor bundle blocked"
         )
         await update_available_abilities_message(
-            reason="incomplete Kienzan bundle blocked"
+            reason="incomplete paired mentor bundle blocked"
         )
         return
 
