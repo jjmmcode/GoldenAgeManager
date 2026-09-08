@@ -1,3 +1,5 @@
+# Golden Age Manager v7.1
+# Adds Form Applications + mandatory `Declined:` Staff feedback with contextual suggestions.
 import os
 import re
 import json
@@ -167,6 +169,19 @@ APPROVED_CHARACTERS_FORUM_ID = 1543909774062518333
 
 CHARACTER_ACCEPTED_TAG = "Accepted"
 CHARACTER_REJECTED_TAG = "Rejected"
+
+
+# ------------------------------------------------------------
+# FORM APPLICATION SYSTEM
+# ------------------------------------------------------------
+
+FORM_APPLICATION_FORUM_ID = 1546894012072329256
+APPROVED_FORMS_FORUM_ID = 1547016509619179540
+
+FORM_ACCEPTED_TAG = "Accepted"
+FORM_REJECTED_TAG = "Rejected"
+FORM_PENDING_TAG = "Pending"
+FORM_VOIDED_TAG = "Voided"
 
 
 # ------------------------------------------------------------
@@ -419,6 +434,7 @@ def load_processed_applications():
     default_state = {
         "mentor": {},
         "character": {},
+        "form": {},
         "mutant": {},
         "meta": {}
     }
@@ -439,6 +455,7 @@ def load_processed_applications():
 
         data.setdefault("mentor", {})
         data.setdefault("character", {})
+        data.setdefault("form", {})
         data.setdefault("mutant", {})
         data.setdefault("meta", {})
 
@@ -4183,53 +4200,423 @@ def detect_race_tag(
 
 
 # ============================================================
+# FORM APPLICATION PARSER
+# ============================================================
+
+def parse_form_application(content: str):
+    """Parse the public Form Application template used by #form-application."""
+
+    aliases = {
+        "character_name": [
+            r"character\s*name",
+            r"character",
+        ],
+        "current_level": [
+            r"current\s*level",
+            r"level",
+        ],
+        "time_played": [
+            r"time\s*played",
+            r"play\s*time",
+            r"time\s*on\s*server",
+        ],
+        "form_requested": [
+            r"form\s*requested",
+            r"requested\s*form",
+            r"transformation\s*requested",
+            r"form",
+        ],
+        "reasoning": [
+            r"reasoning",
+            r"reason",
+            r"justification",
+        ],
+        "roleplay_plan": [
+            r"roleplay\s*plan",
+            r"rp\s*plan",
+            r"unlock\s*plan",
+        ],
+    }
+
+    return parse_labeled_fields(content, aliases)
+
+
+# ============================================================
+# STAFF DECLINE REASON / FEEDBACK SYSTEM
+# ============================================================
+
+DECLINE_REASON_PATTERN = re.compile(
+    r"(?:^|\n)\s*declined\s*:\s*(.+)$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _member_can_supply_decline_reason(member: discord.Member) -> bool:
+    """Only Staff/moderation-capable members may supply an official reason."""
+
+    if member.guild.owner_id == member.id:
+        return True
+
+    permissions = member.guild_permissions
+    return any((
+        permissions.administrator,
+        permissions.manage_guild,
+        permissions.manage_threads,
+        permissions.manage_messages,
+        permissions.moderate_members,
+    ))
+
+
+async def find_latest_staff_decline_reason(thread: discord.Thread):
+    """
+    Find the newest Staff message in the application thread containing:
+
+        Declined: <reason>
+
+    The applicant cannot spoof the reason because only moderation-capable
+    members are considered authoritative.
+    """
+
+    try:
+        async for message in thread.history(limit=100, oldest_first=False):
+            if message.author.bot:
+                continue
+
+            if not isinstance(message.author, discord.Member):
+                continue
+
+            if not _member_can_supply_decline_reason(message.author):
+                continue
+
+            content = (message.content or "").strip()
+            if not content:
+                continue
+
+            match = DECLINE_REASON_PATTERN.search(content)
+            if not match:
+                continue
+
+            reason = clean_value(match.group(1) or "")
+            if not reason:
+                continue
+
+            # Keep Discord messages safely below the 2000-character limit.
+            reason = reason[:1400].strip()
+            return reason, message.author, message
+
+    except discord.Forbidden:
+        print(
+            "❌ Golden Age Manager cannot read application history to find "
+            "the Declined: reason. Check Read Message History."
+        )
+    except discord.HTTPException as error:
+        print(f"❌ Discord API error while reading decline reason: {error}")
+
+    return None
+
+
+def build_decline_suggestions(reason: str, application_kind: str) -> list[str]:
+    """
+    Rule-based contextual suggestions derived from the Staff reason.
+
+    This intentionally does not overrule Staff or invent a new rejection
+    reason. It turns common feedback themes into practical revision ideas.
+    """
+
+    value = normalize(reason)
+    kind = normalize(application_kind)
+    suggestions = []
+
+    def add(*items):
+        for item in items:
+            if item not in suggestions:
+                suggestions.append(item)
+
+    # Capacity / race cap
+    if any(term in value for term in (
+        "race cap", "cap reached", "race full", "slots full",
+        "no slots", "full race", "capacity", "slot unavailable",
+    )):
+        add(
+            "Check the current Race Count before resubmitting.",
+            "Consider adapting the concept to a race that currently has an open slot.",
+            "If you want to keep this race, wait until a slot becomes available before reapplying.",
+        )
+
+    # Powerplaying / guaranteed exceptional status
+    if any(term in value for term in (
+        "powerplay", "power playing", "overpowered", "too powerful",
+        "godlike", "god-like", "guaranteed", "legendary",
+        "unknown potential", "unlimited", "perfect being",
+        "no limits", "future power", "too strong",
+    )):
+        add(
+            "Remove guaranteed future power, transformations, or special status from the concept.",
+            "Give the character meaningful weaknesses, consequences, and situations where they can fail.",
+            "Move major growth into future roleplay instead of establishing it as guaranteed in the application.",
+        )
+
+    # Weakness / balance concerns
+    if any(term in value for term in (
+        "weakness", "weaknesses", "limitation", "limitations",
+        "drawback", "drawbacks", "balance", "balanced", "tradeoff",
+    )):
+        add(
+            "Make the weaknesses concrete and usable in actual roleplay, not only cosmetic.",
+            "Explain what the character cannot do and what consequences come with their strengths.",
+            "Add clear tradeoffs so strong abilities create meaningful risks or costs.",
+        )
+
+    # Lore fit / origin
+    if any(term in value for term in (
+        "lore", "canon", "setting", "origin", "backstory",
+        "doesn't fit", "does not fit", "incompatible", "timeline",
+    )):
+        add(
+            "Adjust the origin and backstory so they fit the server's established lore and timeline.",
+            "Connect important claims to events, factions, locations, or circumstances that can exist in the setting.",
+            "Avoid relying on exceptional canon-level events unless Staff has explicitly approved them.",
+        )
+
+    # Detail / clarity / writing quality
+    if any(term in value for term in (
+        "detail", "details", "too short", "unclear", "vague",
+        "not enough", "insufficient", "underdeveloped", "poorly explained",
+        "needs explanation", "lack of explanation",
+    )):
+        add(
+            "Expand the parts Staff identified as unclear instead of only adding more general text.",
+            "Use concrete examples of how the concept will work during roleplay.",
+            "Make motivations, limitations, and intended development explicit.",
+        )
+
+    # Conduct / RP history / activity
+    if any(term in value for term in (
+        "conduct", "behavior", "behaviour", "roleplay history", "rp history",
+        "activity", "inactive", "time played", "new player", "unestablished",
+    )):
+        add(
+            "Spend more time establishing the character through normal roleplay before reapplying.",
+            "Demonstrate consistent rule-following, activity, and collaborative roleplay.",
+            "Use future RP scenes to show the qualities Staff needs to evaluate rather than only describing them in text.",
+        )
+
+    # Mentor-specific themes
+    if kind == "mentor":
+        if any(term in value for term in (
+            "experience", "mastery", "doesn't know", "does not know",
+            "knowledge", "qualified", "qualification", "training",
+        )):
+            add(
+                "Show clear in-character experience and mastery of the technique before applying again.",
+                "Add training, battles, or lore events that demonstrate why this character is qualified to teach it.",
+                "Explain how the character would actually teach the skill to other players.",
+            )
+        if any(term in value for term in ("availability", "inactive", "activity")):
+            add(
+                "Make sure the mentor can be consistently available to train other players.",
+            )
+
+    # Form-specific themes
+    if kind == "form":
+        if any(term in value for term in (
+            "reason", "reasoning", "weak reasoning", "motivation",
+            "doesn't justify", "does not justify", "earned", "earn",
+        )):
+            add(
+                "Tie the form to the character's existing story instead of only wanting the transformation for power.",
+                "Describe the RP circumstances that would make the unlock feel earned.",
+                "Strengthen the connection between the form, the character's motivations, and recent development.",
+            )
+        if any(term in value for term in (
+            "not open", "not announced", "closed", "unavailable form",
+            "not available", "too early",
+        )):
+            add(
+                "Wait until Staff officially announces that this form is open for applications.",
+                "Do not resubmit the same form while its application window is closed.",
+            )
+
+    # Character-specific fallback tailoring
+    if kind == "character" and any(term in value for term in (
+        "character", "concept", "personality", "motivation",
+    )):
+        add(
+            "Revise the character concept directly around the concern Staff identified.",
+            "Make sure strengths, flaws, motivations, and future development create opportunities for other players to interact with.",
+        )
+
+    # Universal fallback: always give something useful without inventing facts.
+    add(
+        "Revise the application specifically around the Staff reason above before resubmitting.",
+        "Make the changes explicit in the application so Staff can quickly see what was corrected.",
+    )
+
+    return suggestions[:4]
+
+
+async def remove_application_status_tag(
+    thread: discord.Thread,
+    tag_name: str,
+    normalizer=normalize,
+):
+    """Remove one status tag while preserving every other forum tag."""
+
+    target = normalizer(tag_name)
+    remaining_tags = [
+        tag
+        for tag in thread.applied_tags
+        if normalizer(tag.name) != target
+    ]
+
+    await thread.edit(
+        applied_tags=remaining_tags,
+        reason="Golden Age Manager: missing required Declined reason",
+    )
+
+
+async def require_decline_reason_and_reject(
+    thread: discord.Thread,
+    application_label: str,
+    application_kind: str,
+    rejection_tag_name: str,
+    status_word: str = "Rejected",
+    normalizer=normalize,
+) -> bool:
+    """
+    Enforce Staff's `Declined: <reason>` format before closing an application.
+
+    Returns True when the application was actually closed, False when the
+    status tag had to be removed because Staff did not provide a reason.
+    """
+
+    result = await find_latest_staff_decline_reason(thread)
+
+    if result is None:
+        try:
+            await remove_application_status_tag(
+                thread,
+                rejection_tag_name,
+                normalizer=normalizer,
+            )
+
+            await thread.send(
+                "## ⚠️ Missing Decline Reason\n\n"
+                "Before closing this application, a Staff member must post an "
+                "official reason in this thread using:\n\n"
+                "`Declined: <reason>`\n\n"
+                f"The **{status_word}** tag was removed automatically. "
+                "The application remains open."
+            )
+
+            print(
+                f"⚠️ {application_label} close blocked: no Staff "
+                "Declined: reason was found."
+            )
+
+        except discord.Forbidden:
+            print(
+                "❌ Could not remove the status tag after a missing decline "
+                "reason. Check Manage Threads / Send Messages."
+            )
+        except discord.HTTPException as error:
+            print(f"❌ Discord API error enforcing decline reason: {error}")
+
+        return False
+
+    reason, staff_member, _ = result
+    suggestions = build_decline_suggestions(reason, application_kind)
+
+    await reject_application(
+        thread,
+        application_label,
+        reason=reason,
+        suggestions=suggestions,
+        staff_member=staff_member,
+        status_word=status_word,
+    )
+
+    return True
+
+
+# ============================================================
 # REJECTION AUTOMATION
 # ============================================================
 
 async def reject_application(
     thread: discord.Thread,
-    application_label: str
+    application_label: str,
+    reason: str | None = None,
+    suggestions: list[str] | None = None,
+    staff_member: discord.Member | None = None,
+    status_word: str = "Rejected",
 ):
+    """Close an application while preserving Staff's written reasoning."""
 
     try:
+        heading_emoji = "🚫" if normalize(status_word) == "voided" else "❌"
 
-        await thread.send(
-            f"## ❌ {application_label} Rejected\n\n"
+        parts = [
+            f"## {heading_emoji} {application_label} {status_word}",
+            "",
             f"Your {application_label.lower()} has been "
-            "rejected by the Staff Team.\n\n"
-            "If you need clarification regarding this "
-            "decision, please contact a member of Staff."
-        )
+            f"{status_word.lower()} by the Staff Team.",
+        ]
+
+        if reason:
+            parts.extend([
+                "",
+                "### 📋 Staff Reason",
+                f"> {reason.replace(chr(10), chr(10) + '> ')}",
+            ])
+
+        if suggestions:
+            parts.extend([
+                "",
+                "### 💡 Golden Age Suggestions",
+            ])
+            parts.extend(
+                f"• {suggestion}"
+                for suggestion in suggestions
+            )
+            parts.extend([
+                "",
+                "These suggestions are based on the Staff reason above and "
+                "are meant to help with a future revision. Staff's decision "
+                "and reasoning remain authoritative.",
+            ])
+
+        if staff_member is not None:
+            parts.extend([
+                "",
+                f"**Reviewed by:** {staff_member.mention}",
+            ])
+
+        await thread.send("\n".join(parts)[:1990])
 
         await thread.edit(
             archived=True,
             locked=True,
             reason=(
                 "Golden Age Manager: "
-                f"{application_label} rejected"
+                f"{application_label} {status_word.lower()}"
             )
         )
 
         print(
-            f"❌ {application_label} rejected."
+            f"❌ {application_label} {status_word.lower()} with Staff reason."
         )
-
-        print(
-            "🔒 Application archived and locked."
-        )
+        print("🔒 Application archived and locked.")
 
     except discord.Forbidden:
-
         print(
-            "❌ Golden Age Manager doesn't have "
-            "permission to reject this application."
+            "❌ Golden Age Manager doesn't have permission to close "
+            "this application."
         )
 
     except discord.HTTPException as error:
-
         print(
-            f"❌ Discord API error while rejecting: "
-            f"{error}"
+            f"❌ Discord API error while closing application: {error}"
         )
 
 
@@ -4268,6 +4655,12 @@ async def on_ready():
 
         "approved-characters":
             APPROVED_CHARACTERS_FORUM_ID,
+
+        "form-application":
+            FORM_APPLICATION_FORUM_ID,
+
+        "approved-forms":
+            APPROVED_FORMS_FORUM_ID,
     }
 
     for (
@@ -4314,7 +4707,9 @@ async def on_ready():
         # Mutant applications are retired in v7.0. Race Count now tracks
         # only Accepted Character Applications.
         await update_race_count_message(reason="startup")
-        print("🧬 Legacy Mutant application/count system: RETIRED (v7.0).")
+        print("🧬 Legacy Mutant application/count system: RETIRED (v7.1).")
+        print("📝 Declined: feedback system enabled for Character, Mentor, and Form Applications.")
+        print("🔥 Form Application automation enabled (v7.1).")
         await sync_all_community_access()
         INITIAL_ACCESS_SYNC_DONE = True
         print()
@@ -4529,6 +4924,18 @@ async def on_thread_update(
 
         return
 
+    if (
+        after.parent_id
+        == FORM_APPLICATION_FORUM_ID
+    ):
+
+        await handle_form_application(
+            before,
+            after
+        )
+
+        return
+
 
 # ============================================================
 # MENTOR AUTOMATION
@@ -4594,18 +5001,22 @@ async def handle_mentor_application(
         MENTOR_REJECTED_TAG
     ) in newly_added:
 
-        await reject_application(
+        closed = await require_decline_reason_and_reject(
             after,
-            "Mentor Application"
+            "Mentor Application",
+            "mentor",
+            MENTOR_REJECTED_TAG,
+            normalizer=normalize,
         )
 
-        await rebuild_approved_mentor_records()
-        await update_mentor_list_message(
-            reason="mentor application rejected"
-        )
-        await update_available_abilities_message(
-            reason="mentor application rejected"
-        )
+        if closed:
+            await rebuild_approved_mentor_records()
+            await update_mentor_list_message(
+                reason="mentor application rejected"
+            )
+            await update_available_abilities_message(
+                reason="mentor application rejected"
+            )
 
         return
 
@@ -5112,15 +5523,19 @@ async def handle_character_application(
         CHARACTER_REJECTED_TAG
     ) in newly_added:
 
-        await reject_application(
+        closed = await require_decline_reason_and_reject(
             after,
-            "Character Application"
+            "Character Application",
+            "character",
+            CHARACTER_REJECTED_TAG,
+            normalizer=normalize,
         )
 
-        await rebuild_approved_character_cache()
-        await update_race_count_message(
-            reason="character rejected"
-        )
+        if closed:
+            await rebuild_approved_character_cache()
+            await update_race_count_message(
+                reason="character rejected"
+            )
 
         return
 
@@ -5691,6 +6106,215 @@ async def handle_character_application(
         )
 
         print()
+
+
+# ============================================================
+# FORM APPLICATION AUTOMATION
+# ============================================================
+
+async def handle_form_application(
+    before: discord.Thread,
+    after: discord.Thread,
+):
+    """Handle Accepted / Rejected / Voided states in #form-application."""
+
+    before_tags = {
+        normalize_forum_tag(tag.name)
+        for tag in before.applied_tags
+    }
+    after_tags = {
+        normalize_forum_tag(tag.name)
+        for tag in after.applied_tags
+    }
+
+    newly_added = after_tags - before_tags
+    if not newly_added:
+        return
+
+    accepted_name = normalize_forum_tag(FORM_ACCEPTED_TAG)
+    rejected_name = normalize_forum_tag(FORM_REJECTED_TAG)
+    voided_name = normalize_forum_tag(FORM_VOIDED_TAG)
+
+    # --------------------------------------------------------
+    # REJECTED
+    # --------------------------------------------------------
+    if rejected_name in newly_added:
+        await require_decline_reason_and_reject(
+            after,
+            "Form Application",
+            "form",
+            FORM_REJECTED_TAG,
+            status_word="Rejected",
+            normalizer=normalize_forum_tag,
+        )
+        return
+
+    # --------------------------------------------------------
+    # VOIDED
+    # --------------------------------------------------------
+    if voided_name in newly_added:
+        await require_decline_reason_and_reject(
+            after,
+            "Form Application",
+            "form",
+            FORM_VOIDED_TAG,
+            status_word="Voided",
+            normalizer=normalize_forum_tag,
+        )
+        return
+
+    # --------------------------------------------------------
+    # ACCEPTED
+    # --------------------------------------------------------
+    if accepted_name not in newly_added:
+        return
+
+    if application_was_processed("form", after.id):
+        destination_exists = await processed_destination_exists(
+            "form",
+            after.id,
+            APPROVED_FORMS_FORUM_ID,
+        )
+
+        if destination_exists:
+            print(
+                "⚠️ This Form Application was already processed. "
+                "Approved-form duplicate skipped."
+            )
+            return
+
+        unmark_application_processed("form", after.id)
+        print(
+            "♻️ Processed Form profile is missing from approved-forms. "
+            "Rebuilding it now..."
+        )
+
+    print()
+    print("=" * 65)
+    print("🔥 FORM APPROVAL DETECTED")
+    print(f"📋 {after.name}")
+    print("=" * 65)
+
+    approved_forum = await get_channel(APPROVED_FORMS_FORUM_ID)
+    if not isinstance(approved_forum, discord.ForumChannel):
+        print("❌ approved-forms not found.")
+        return
+
+    starter_message = await get_starter_message(after)
+    if starter_message is None:
+        print("❌ Starter message not found for Form Application.")
+        return
+
+    application = parse_form_application(starter_message.content or "")
+    character_name = clean_value(application.get("character_name") or "")
+    current_level = clean_value(application.get("current_level") or "")
+    time_played = clean_value(application.get("time_played") or "")
+    form_requested = clean_value(application.get("form_requested") or "")
+    reasoning = clean_value(application.get("reasoning") or "")
+    roleplay_plan = clean_value(application.get("roleplay_plan") or "")
+
+    embed = discord.Embed(title="✅ Approved Form")
+    embed.set_author(
+        name=starter_message.author.display_name,
+        icon_url=starter_message.author.display_avatar.url,
+    )
+
+    if character_name and form_requested:
+        embed.description = f"## {character_name}\n**{form_requested}**"
+    elif character_name:
+        embed.description = f"## {character_name}"
+    elif form_requested:
+        embed.description = f"## {form_requested}"
+
+    if current_level:
+        embed.add_field(
+            name="⚡ Current Level",
+            value=current_level[:1024],
+            inline=True,
+        )
+
+    if time_played:
+        embed.add_field(
+            name="⏱️ Time Played",
+            value=time_played[:1024],
+            inline=True,
+        )
+
+    if form_requested:
+        embed.add_field(
+            name="🔥 Form",
+            value=form_requested[:1024],
+            inline=False,
+        )
+
+    if reasoning:
+        add_long_field(embed, "📖 Reasoning", reasoning)
+
+    if roleplay_plan:
+        add_long_field(embed, "🎭 Roleplay Plan", roleplay_plan)
+
+    embed.add_field(
+        name="🔗 Application",
+        value=f"[View original application]({starter_message.jump_url})",
+        inline=False,
+    )
+
+    embed.set_footer(
+        text="Dragon Ball: Golden Age • Form Unlocking Program"
+    )
+
+    files, thumbnail_filename = await prepare_attachments(starter_message)
+    if thumbnail_filename:
+        embed.set_thumbnail(
+            url=f"attachment://{thumbnail_filename}"
+        )
+
+    try:
+        # approved-forms currently does not require a category mapping from the
+        # source application. If Staff later adds destination tags (Saiyan,
+        # Namekian, etc.), a mapping can be added without changing this flow.
+        result = await approved_forum.create_thread(
+            name=after.name[:100],
+            embed=embed,
+            files=files,
+        )
+
+        approved_thread = result.thread
+        mark_application_processed(
+            "form",
+            after.id,
+            approved_thread.id,
+        )
+
+        await after.send(
+            "## ✅ Form Application Approved\n\n"
+            "Your Form Application has been accepted by the Staff Team.\n\n"
+            f"🔥 **Form:** `{form_requested or 'See application'}`\n\n"
+            f"Your approved record has been published in "
+            f"{approved_forum.mention}."
+        )
+
+        await after.edit(
+            archived=True,
+            locked=True,
+            reason="Golden Age Manager: Form Application approved",
+        )
+
+        print(f"✅ Approved form profile created: {approved_thread.name}")
+        print("🔒 Original Form Application archived.")
+
+    except discord.Forbidden:
+        print(
+            "❌ Permission error during Form approval. Check Create Posts, "
+            "Send Messages in Posts, Embed Links, Attach Files, Manage Posts, "
+            "and Read Message History."
+        )
+
+    except discord.HTTPException as error:
+        print(f"❌ Discord API error during Form approval: {error}")
+
+    except Exception as error:
+        print(f"❌ Unexpected Form approval error: {error!r}")
 
 
 # ============================================================
