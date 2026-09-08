@@ -170,8 +170,14 @@ CHARACTER_REJECTED_TAG = "Rejected"
 
 
 # ------------------------------------------------------------
-# MUTANT SYSTEM
+# LEGACY MUTANT SYSTEM (RETIRED IN v7.0)
 # ------------------------------------------------------------
+# The old direct Mutant application / approval workflow is intentionally
+# disabled. Existing constants and helper functions remain below only for
+# backwards compatibility with historical data and can be removed in a later
+# cleanup once Staff confirms the archived forums are no longer needed.
+# v7.0 does NOT scan these forums, publish approved-mutant profiles, enforce
+# Mutant race caps, or include a Mutant Count in #information.
 
 MUTANT_APPLICATION_FORUM_ID = 1544184281474142258
 APPROVED_MUTANTS_FORUM_ID = 1544184521862291516
@@ -262,9 +268,8 @@ RACE_COUNT_LIMITS = {
     "Tuffle": ("Tuffle", 5),
 }
 
-# Mutant Count follows the categories used in #information.
-# Android is intentionally not a separate mutant category.
-# Tuffle is not added here yet: this version only adds Tuffle as a main race.
+# Legacy-only: retained for historical parsing helpers. v7.0 no longer
+# publishes or enforces Mutant counts/caps.
 MUTANT_COUNT_RACES = {
     "Saiyan": "Saiyan",
     "Human": "Human",
@@ -274,8 +279,7 @@ MUTANT_COUNT_RACES = {
     "Majin": "Majin",
 }
 
-# Every Mutant category has a hard cap of 3 approved characters.
-# Android Mutants are grouped under Human, matching MUTANT_COUNT_RACES.
+# Legacy-only historical value; no Mutant cap is enforced in v7.0.
 MUTANT_LIMIT_PER_RACE = 3
 
 RACE_COUNT_LOCK = asyncio.Lock()
@@ -1596,32 +1600,10 @@ def get_race_counts():
     return counts
 
 
-def get_mutant_counts():
-    """Returns Mutant characters grouped by canonical race."""
-
-    counts = {
-        race_tag: []
-        for race_tag in MUTANT_COUNT_RACES
-    }
-
-    for record in APPROVED_MUTANT_RECORDS.values():
-        race_tag = record.get("race")
-        name = record.get("name") or "Unknown"
-
-        if race_tag in counts:
-            counts[race_tag].append(name)
-
-    for names in counts.values():
-        names.sort(key=str.casefold)
-
-    return counts
-
-
 def build_race_count_message():
-    """Builds the public Race Count + Mutant Count from Accepted apps."""
+    """Builds the public Race Count from Accepted Character Applications."""
 
     counts = get_race_counts()
-    mutant_counts = get_mutant_counts()
 
     lines = [
         "## Race Count",
@@ -1646,39 +1628,8 @@ def build_race_count_message():
 
     lines.extend([
         "",
-        "## Mutant Count",
-        "",
-    ])
-
-    for race_tag, display_name in MUTANT_COUNT_RACES.items():
-        names = mutant_counts.get(race_tag, [])
-        count = len(names)
-        limit = MUTANT_LIMIT_PER_RACE
-
-        if count > limit:
-            status = " <- OVER CAP"
-        elif count >= limit:
-            status = " <- FULL"
-        elif count >= 2:
-            status = " <- LIMITED"
-        else:
-            status = ""
-
-        if names:
-            lines.append(
-                f"**{display_name}:** {count}/{limit}{status} "
-                f"({', '.join(names)})"
-            )
-        else:
-            lines.append(
-                f"**{display_name}:** 0/{limit}"
-            )
-
-    lines.extend([
-        "",
         "-# Automatically updated by Golden Age Manager.",
         "-# Race Count uses Accepted Character Applications only.",
-        "-# Mutant Count uses Accepted Mutant Applications only (max 3 per race).",
     ])
 
     return "\n".join(lines)
@@ -4317,12 +4268,6 @@ async def on_ready():
 
         "approved-characters":
             APPROVED_CHARACTERS_FORUM_ID,
-
-        "mutant-application":
-            MUTANT_APPLICATION_FORUM_ID,
-
-        "approved-mutants":
-            APPROVED_MUTANTS_FORUM_ID,
     }
 
     for (
@@ -4366,10 +4311,10 @@ async def on_ready():
         await update_mentor_list_message(reason="startup")
         await update_available_abilities_message(reason="startup")
         await rebuild_approved_character_cache()
-        await rebuild_approved_mutant_cache()
-        await reconcile_accepted_mutant_applications()
-        await rebuild_approved_mutant_cache()
+        # Mutant applications are retired in v7.0. Race Count now tracks
+        # only Accepted Character Applications.
         await update_race_count_message(reason="startup")
+        print("🧬 Legacy Mutant application/count system: RETIRED (v7.0).")
         await sync_all_community_access()
         INITIAL_ACCESS_SYNC_DONE = True
         print()
@@ -4578,19 +4523,6 @@ async def on_thread_update(
     ):
 
         await handle_character_application(
-            before,
-            after
-        )
-
-        return
-
-
-    if (
-        after.parent_id
-        == MUTANT_APPLICATION_FORUM_ID
-    ):
-
-        await handle_mutant_application(
             before,
             after
         )
