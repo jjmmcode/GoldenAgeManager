@@ -273,7 +273,7 @@ RACE_COUNT_CHANNEL_ID = 1543938120301551626
 # Counts are based on Accepted Character Applications, not raw race roles.
 # This prevents self-assigned / legacy race roles from consuming slots.
 RACE_COUNT_LIMITS = {
-    "Saiyan": ("Saiyan", 10),
+    "Saiyan": ("Saiyan", 11),
     "Human": ("Human", 10),
     "Android": ("Human (Android)", 2),
     "Namekian": ("Namekian", 10),
