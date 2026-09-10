@@ -4220,50 +4220,72 @@ def parse_character_application(
 def detect_race_tag(
     race_value: str
 ):
+    """
+    Resolves a Character Application race without letting backstory text
+    override the explicit Race/Species field.
+
+    Some legacy applications place several fields on one physical line. A
+    value can therefore look like::
+
+        Android Nobushi was created as an android ... Horatio, a Namekian ...
+
+    The old detector searched the ENTIRE captured value and then preferred the
+    longest matching race alias. In that example, a later backstory mention of
+    "Namekian" could incorrectly beat the explicit leading "Android".
+
+    v7.3 gives absolute priority to the race written at the BEGINNING of the
+    labeled field. Only short legacy values get the older contains fallback.
+    """
 
     if not race_value:
         return None
 
-    race_normalized = normalize(
-        race_value
-    )
-
-    matches = []
-
-    for (
-        written_race,
-        target_tag
-    ) in RACE_MAPPING.items():
-
-        written_normalized = normalize(
-            written_race
-        )
-
-        if (
-            race_normalized
-            == written_normalized
-            or written_normalized
-            in race_normalized
-        ):
-
-            matches.append(
-                (
-                    len(
-                        written_normalized
-                    ),
-                    target_tag
-                )
-            )
-
-    if not matches:
+    race_normalized = normalize(race_value)
+    if not race_normalized:
         return None
 
-    matches.sort(
-        key=lambda item: item[0],
-        reverse=True
-    )
+    # 1) Exact match or explicit race at the beginning of the field.
+    # Longest aliases are checked first so "human (android)" wins over
+    # "human", and "frost demon" wins over shorter variants.
+    prefix_matches = []
 
-    return matches[0][1]
+    for written_race, target_tag in RACE_MAPPING.items():
+        written_normalized = normalize(written_race)
+        if not written_normalized:
+            continue
+
+        if race_normalized == written_normalized:
+            prefix_matches.append((len(written_normalized), target_tag))
+            continue
+
+        if race_normalized.startswith(written_normalized):
+            remainder = race_normalized[len(written_normalized):]
+            # Require a boundary after the race alias. This prevents aliases
+            # such as "human" from matching arbitrary longer words.
+            if not remainder or not remainder[0].isalnum():
+                prefix_matches.append((len(written_normalized), target_tag))
+            elif remainder[0].isspace():
+                prefix_matches.append((len(written_normalized), target_tag))
+
+    if prefix_matches:
+        prefix_matches.sort(key=lambda item: item[0], reverse=True)
+        return prefix_matches[0][1]
+
+    # 2) Legacy compatibility only for compact race values. Do NOT scan a
+    # paragraph/backstory for race words. This still supports entries such as
+    # "Race: Mutant Saiyan" or other short decorated legacy values.
+    if len(race_normalized) <= 80:
+        matches = []
+        for written_race, target_tag in RACE_MAPPING.items():
+            written_normalized = normalize(written_race)
+            if written_normalized and written_normalized in race_normalized:
+                matches.append((len(written_normalized), target_tag))
+
+        if matches:
+            matches.sort(key=lambda item: item[0], reverse=True)
+            return matches[0][1]
+
+    return None
 
 
 # ============================================================
@@ -4774,10 +4796,11 @@ async def on_ready():
         # Mutant applications are retired. Race Count now reconciles Accepted
         # Character Applications against current Discord membership + race roles.
         await update_race_count_message(reason="startup")
-        print("🧬 Legacy Mutant application/count system: RETIRED (v7.2).")
+        print("🧬 Legacy Mutant application/count system: RETIRED (v7.3).")
         print("📝 Declined: feedback system enabled for Character, Mentor, and Form Applications.")
-        print("🔥 Form Application automation enabled (v7.2).")
-        print("👥 Active Race Count reconciliation enabled (v7.2).")
+        print("🔥 Form Application automation enabled (v7.3).")
+        print("👥 Active Race Count reconciliation enabled (v7.3).")
+        print("🧬 Explicit Race/Species field priority fix enabled (v7.3).")
         await sync_all_community_access()
         INITIAL_ACCESS_SYNC_DONE = True
         print()
