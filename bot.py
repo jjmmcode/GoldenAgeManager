@@ -396,6 +396,10 @@ RACE_MAPPING = {
     "android/human": "Android",
     "android-human": "Android",
     "cyborg": "Android",
+    "human cyborg": "Android",
+    "organic android": "Android",
+    "human organic android": "Android",
+    "human cyborg organic android": "Android",
     "artificial human": "Android",
 
     # Majins
@@ -3991,7 +3995,7 @@ def extract_character_race_fallback(content: str):
             rf"(?i)(?<!\w){label}\s*{separator}\s*"
             rf"(?:\*{{0,2}}|_{{0,2}})?"
             rf"(.+?)"
-            rf"(?=\s+(?:birth\s*name|character\s*name|name|alignment|class|"
+            rf"(?=\s+(?:birth\s*name|character\s*name|name|born|designation|affiliation|alignment|class|"
             rf"combat\s*role|age|sex|gender|family|alias|nickname|"
             rf"fighting\s*style|combat\s*style|mutant(?:\s*status)?|"
             rf"mutation(?:\s*status)?)\s*(?:[:：=]|[-–—])|$)"
@@ -4207,14 +4211,24 @@ def parse_character_application(
         aliases
     )
 
-    if not application.get("race"):
-        fallback_race = extract_character_race_fallback(content)
+    # The explicit labeled Race/Species field is authoritative.
+    # Generic parsing can swallow following fields in compact/legacy posts,
+    # so always prefer the dedicated extractor when it succeeds.
+    explicit_race = extract_character_race_fallback(content)
 
-        if fallback_race:
-            application["race"] = fallback_race
+    if explicit_race:
+        previous_race = application.get("race")
+        application["race"] = explicit_race
+
+        if not previous_race:
             print(
                 f"🧬 Race parser fallback detected: "
-                f"{fallback_race!r}"
+                f"{explicit_race!r}"
+            )
+        elif normalize(previous_race) != normalize(explicit_race):
+            print(
+                f"🧬 Race parser corrected labeled value: "
+                f"{previous_race!r} -> {explicit_race!r}"
             )
 
     return application
@@ -4256,6 +4270,17 @@ def detect_race_tag(
     if re.match(r"^human\s+androids?\b", leading_words):
         return "Android"
     if re.match(r"^androids?\s+human\b", leading_words):
+        return "Android"
+
+    # Human-derived cyborg / organic-android descriptions still occupy the
+    # Human (Android) bucket. Examples:
+    #   Human (Cyborg / Organic Android)
+    #   Human (Cyborg)
+    #   Human / Organic Android
+    if leading_words.startswith("human ") and re.search(
+        r"\b(?:androids?|cyborgs?|organic\s+androids?|artificial\s+humans?)\b",
+        leading_words,
+    ):
         return "Android"
 
     # Bio-Android must also win before the generic Android alias.
@@ -4810,13 +4835,14 @@ async def on_ready():
         # Mutant applications are retired. Race Count now reconciles Accepted
         # Character Applications against current Discord membership + race roles.
         await update_race_count_message(reason="startup")
-        print("🧬 Legacy Mutant application/count system: RETIRED (v7.4).")
+        print("🧬 Legacy Mutant application/count system: RETIRED (v7.5).")
         print("📝 Declined: feedback system enabled for Character, Mentor, and Form Applications.")
-        print("🔥 Form Application automation enabled (v7.4).")
-        print("👥 Active Race Count reconciliation enabled (v7.4).")
-        print("🧬 Explicit Race/Species field priority fix enabled (v7.4).")
-        print("🤖 Human/Android race disambiguation enabled (v7.4).")
-        print("🟠 Saiyan race cap set to 11 (v7.4).")
+        print("🔥 Form Application automation enabled (v7.5).")
+        print("👥 Active Race Count reconciliation enabled (v7.5).")
+        print("🧬 Explicit Race/Species field priority fix enabled (v7.5).")
+        print("🤖 Human/Android race disambiguation enabled (v7.5).")
+        print("🟠 Saiyan race cap set to 11 (v7.5).")
+        print("🧠 Robust compact-field race parsing enabled (v7.5).")
         await sync_all_community_access()
         INITIAL_ACCESS_SYNC_DONE = True
         print()
