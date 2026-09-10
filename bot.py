@@ -385,9 +385,16 @@ RACE_MAPPING = {
     "android": "Android",
     "android race": "Android",
     "human android": "Android",
+    "human androids": "Android",
     "human/android": "Android",
+    "human/androids": "Android",
+    "human-android": "Android",
+    "human-androids": "Android",
     "human (android)": "Android",
+    "human (androids)": "Android",
     "android human": "Android",
+    "android/human": "Android",
+    "android-human": "Android",
     "cyborg": "Android",
     "artificial human": "Android",
 
@@ -4221,20 +4228,13 @@ def detect_race_tag(
     race_value: str
 ):
     """
-    Resolves a Character Application race without letting backstory text
-    override the explicit Race/Species field.
+    Resolve the race written in the explicit Race/Species field.
 
-    Some legacy applications place several fields on one physical line. A
-    value can therefore look like::
-
-        Android Nobushi was created as an android ... Horatio, a Namekian ...
-
-    The old detector searched the ENTIRE captured value and then preferred the
-    longest matching race alias. In that example, a later backstory mention of
-    "Namekian" could incorrectly beat the explicit leading "Android".
-
-    v7.3 gives absolute priority to the race written at the BEGINNING of the
-    labeled field. Only short legacy values get the older contains fallback.
+    v7.4 keeps the v7.3 protection against backstory mentions and adds a
+    dedicated Human/Android disambiguation pass. Discord applications have
+    historically used several equivalent spellings such as ``Human/Androids``,
+    ``Human - Android`` and ``Human (Android)``. Those must resolve to the
+    Android slot before the generic ``Human`` alias is considered.
     """
 
     if not race_value:
@@ -4244,9 +4244,26 @@ def detect_race_tag(
     if not race_normalized:
         return None
 
-    # 1) Exact match or explicit race at the beginning of the field.
-    # Longest aliases are checked first so "human (android)" wins over
-    # "human", and "frost demon" wins over shorter variants.
+    # Only inspect the beginning of the labeled value for special compound
+    # races. This prevents words later in a backstory from changing the race.
+    leading = race_normalized[:80]
+    leading_words = re.sub(r"[^a-z0-9]+", " ", leading).strip()
+    leading_words = re.sub(r"\s+", " ", leading_words)
+
+    # Human/Android is a distinct race bucket. Check it BEFORE plain Human.
+    # Accept common historical variants: Human/Android(s), Human-Android,
+    # Human (Android), Android/Human, etc.
+    if re.match(r"^human\s+androids?\b", leading_words):
+        return "Android"
+    if re.match(r"^androids?\s+human\b", leading_words):
+        return "Android"
+
+    # Bio-Android must also win before the generic Android alias.
+    if re.match(r"^bio\s+androids?\b", leading_words):
+        return "Bio-Android"
+
+    # 1) Exact match or explicit race at the beginning of the field. Longest
+    # aliases are checked first so compound races win over generic aliases.
     prefix_matches = []
 
     for written_race, target_tag in RACE_MAPPING.items():
@@ -4260,8 +4277,6 @@ def detect_race_tag(
 
         if race_normalized.startswith(written_normalized):
             remainder = race_normalized[len(written_normalized):]
-            # Require a boundary after the race alias. This prevents aliases
-            # such as "human" from matching arbitrary longer words.
             if not remainder or not remainder[0].isalnum():
                 prefix_matches.append((len(written_normalized), target_tag))
             elif remainder[0].isspace():
@@ -4271,9 +4286,8 @@ def detect_race_tag(
         prefix_matches.sort(key=lambda item: item[0], reverse=True)
         return prefix_matches[0][1]
 
-    # 2) Legacy compatibility only for compact race values. Do NOT scan a
-    # paragraph/backstory for race words. This still supports entries such as
-    # "Race: Mutant Saiyan" or other short decorated legacy values.
+    # 2) Legacy compatibility only for compact race values. Never scan a
+    # paragraph/backstory for race words.
     if len(race_normalized) <= 80:
         matches = []
         for written_race, target_tag in RACE_MAPPING.items():
@@ -4796,11 +4810,13 @@ async def on_ready():
         # Mutant applications are retired. Race Count now reconciles Accepted
         # Character Applications against current Discord membership + race roles.
         await update_race_count_message(reason="startup")
-        print("🧬 Legacy Mutant application/count system: RETIRED (v7.3).")
+        print("🧬 Legacy Mutant application/count system: RETIRED (v7.4).")
         print("📝 Declined: feedback system enabled for Character, Mentor, and Form Applications.")
-        print("🔥 Form Application automation enabled (v7.3).")
-        print("👥 Active Race Count reconciliation enabled (v7.3).")
-        print("🧬 Explicit Race/Species field priority fix enabled (v7.3).")
+        print("🔥 Form Application automation enabled (v7.4).")
+        print("👥 Active Race Count reconciliation enabled (v7.4).")
+        print("🧬 Explicit Race/Species field priority fix enabled (v7.4).")
+        print("🤖 Human/Android race disambiguation enabled (v7.4).")
+        print("🟠 Saiyan race cap set to 11 (v7.4).")
         await sync_all_community_access()
         INITIAL_ACCESS_SYNC_DONE = True
         print()
