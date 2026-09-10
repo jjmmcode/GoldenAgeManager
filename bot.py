@@ -270,8 +270,9 @@ ACCESS_SYNC_IN_PROGRESS = set()
 
 RACE_COUNT_CHANNEL_ID = 1543938120301551626
 
-# Counts are based on Accepted Character Applications, not raw race roles.
-# This prevents self-assigned / legacy race roles from consuming slots.
+# Counts are based on Accepted Character Applications filtered against the
+# current Discord roster and matching race roles. Departed players or stale
+# race roles no longer consume public race slots.
 RACE_COUNT_LIMITS = {
     "Saiyan": ("Saiyan", 11),
     "Human": ("Human", 10),
@@ -1601,26 +1602,65 @@ async def audit_approved_character_registry():
         print("   ✅ Accepted applications and bot-managed approved profiles match.")
 
 
-def get_race_counts():
-    """Returns current approved-player counts by application race tag."""
+def get_race_counts(guild: discord.Guild):
+    """
+    Returns the CURRENT active race population.
+
+    A character only consumes a slot when:
+      1) its Character Application is currently Accepted,
+      2) the application owner is still a member of the Discord server, and
+      3) that member still holds the Discord race role associated with the
+         accepted character.
+
+    This keeps old/archived applications from permanently consuming slots
+    after a player leaves the server or loses their race role, while still
+    using the Character Application to distinguish races such as Human vs
+    Android (which intentionally share one Discord role).
+    """
 
     counts = {
         race_tag: 0
         for race_tag in RACE_COUNT_LIMITS
     }
 
+    inactive_departed = 0
+    role_mismatch = 0
+
     for record in APPROVED_CHARACTER_RECORDS.values():
         race_tag_name = record.get("race")
-        if race_tag_name in counts:
-            counts[race_tag_name] += 1
+        user_id = record.get("user_id")
 
-    return counts
+        if race_tag_name not in counts or not user_id:
+            continue
+
+        member = guild.get_member(int(user_id))
+        if member is None:
+            inactive_departed += 1
+            continue
+
+        race_role_id = CHARACTER_RACE_ROLE_IDS.get(race_tag_name)
+        if race_role_id is None:
+            role_mismatch += 1
+            continue
+
+        member_role_ids = {
+            role.id
+            for role in member.roles
+        }
+
+        if race_role_id not in member_role_ids:
+            role_mismatch += 1
+            continue
+
+        counts[race_tag_name] += 1
+
+    return counts, inactive_departed, role_mismatch
 
 
-def build_race_count_message():
-    """Builds the public Race Count from Accepted Character Applications."""
+def build_race_count_message(guild: discord.Guild):
+    """Builds the public Race Count from the active Discord roster."""
 
-    counts = get_race_counts()
+    counts, _, _ = get_race_counts(guild)
 
     lines = [
         "## Race Count",
@@ -1646,7 +1686,8 @@ def build_race_count_message():
     lines.extend([
         "",
         "-# Automatically updated by Golden Age Manager.",
-        "-# Race Count uses Accepted Character Applications only.",
+        "-# Counts active Accepted characters only: the player must still be in",
+        "-# the server and still hold the corresponding race role.",
     ])
 
     return "\n".join(lines)
@@ -1706,8 +1747,34 @@ async def update_race_count_message(reason: str = "automatic update"):
             )
             return False
 
-        content = build_race_count_message()
+        counts, departed_records, role_mismatches = get_race_counts(
+            channel.guild
+        )
+        content = build_race_count_message(channel.guild)
         message = await get_race_count_message(channel)
+
+        if reason == "startup" or departed_records or role_mismatches:
+            active_total = sum(counts.values())
+            diagnostic_text = ", ".join(
+                f"{RACE_COUNT_LIMITS[race][0]}: {counts.get(race, 0)}"
+                for race in RACE_COUNT_LIMITS
+            )
+            print(
+                f"👥 Active race roster: {active_total} active accepted "
+                f"character slot(s)."
+            )
+            print(f"📊 Active role-based breakdown: {diagnostic_text}")
+            if departed_records:
+                print(
+                    f"🚪 Excluded {departed_records} Accepted character "
+                    "record(s) because the player is no longer in the server."
+                )
+            if role_mismatches:
+                print(
+                    f"🏷️ Excluded {role_mismatches} Accepted character "
+                    "record(s) because the player no longer has the matching "
+                    "race role."
+                )
 
         try:
             if message is None:
@@ -4704,12 +4771,13 @@ async def on_ready():
         await update_mentor_list_message(reason="startup")
         await update_available_abilities_message(reason="startup")
         await rebuild_approved_character_cache()
-        # Mutant applications are retired in v7.0. Race Count now tracks
-        # only Accepted Character Applications.
+        # Mutant applications are retired. Race Count now reconciles Accepted
+        # Character Applications against current Discord membership + race roles.
         await update_race_count_message(reason="startup")
-        print("🧬 Legacy Mutant application/count system: RETIRED (v7.1).")
+        print("🧬 Legacy Mutant application/count system: RETIRED (v7.2).")
         print("📝 Declined: feedback system enabled for Character, Mentor, and Form Applications.")
-        print("🔥 Form Application automation enabled (v7.1).")
+        print("🔥 Form Application automation enabled (v7.2).")
+        print("👥 Active Race Count reconciliation enabled (v7.2).")
         await sync_all_community_access()
         INITIAL_ACCESS_SYNC_DONE = True
         print()
@@ -4737,39 +4805,92 @@ async def on_member_update(
     before: discord.Member,
     after: discord.Member
 ):
-    """Keeps Community Access aligned with Member + Verified."""
+    """
+    Keeps Community Access aligned with Member + Verified and refreshes the
+    public Race Count whenever a relevant race/access role changes.
+    """
 
-    watched_role_ids = {
+    access_role_ids = {
         MEMBER_ROLE_ID,
         VERIFIED_ROLE_ID,
         COMMUNITY_ACCESS_ROLE_ID,
     }
 
-    before_ids = {
+    race_role_ids = set(
+        CHARACTER_RACE_ROLE_IDS.values()
+    )
+
+    before_access_ids = {
         role.id
         for role in before.roles
-        if role.id in watched_role_ids
+        if role.id in access_role_ids
     }
 
-    after_ids = {
+    after_access_ids = {
         role.id
         for role in after.roles
-        if role.id in watched_role_ids
+        if role.id in access_role_ids
     }
 
-    if before_ids == after_ids:
+    before_race_ids = {
+        role.id
+        for role in before.roles
+        if role.id in race_role_ids
+    }
+
+    after_race_ids = {
+        role.id
+        for role in after.roles
+        if role.id in race_role_ids
+    }
+
+    access_changed = (
+        before_access_ids != after_access_ids
+    )
+
+    race_changed = (
+        before_race_ids != after_race_ids
+    )
+
+    if not access_changed and not race_changed:
         return
 
-    sync_key = (after.guild.id, after.id)
+    if access_changed:
+        sync_key = (after.guild.id, after.id)
 
-    if sync_key in ACCESS_SYNC_IN_PROGRESS:
-        return
+        if sync_key not in ACCESS_SYNC_IN_PROGRESS:
+            await sync_community_access_for_member(
+                after,
+                reason=(
+                    "Golden Age Manager: Member + Verified access gate"
+                )
+            )
 
-    await sync_community_access_for_member(
-        after,
-        reason=(
-            "Golden Age Manager: Member + Verified access gate"
+    if race_changed:
+        await update_race_count_message(
+            reason=f"race role change for {after}"
         )
+
+
+@client.event
+async def on_member_remove(member: discord.Member):
+    """
+    Immediately frees race slots when a player leaves the Discord server.
+
+    Accepted application history is preserved, but departed members no longer
+    count toward the public Race Count.
+    """
+
+    if member.bot:
+        return
+
+    await update_race_count_message(
+        reason=f"member left: {member}"
+    )
+
+    print(
+        f"🚪 Member left the server: {member}. "
+        "Race Count reconciled against the active roster."
     )
 
 
