@@ -14,6 +14,8 @@ from openpyxl.chart import BarChart, Reference
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.table import Table, TableStyleInfo
+from docx import Document
+from docx.shared import Inches, Pt, RGBColor
 
 
 # ============================================================
@@ -170,6 +172,9 @@ APPROVED_CHARACTERS_FORUM_ID = 1543909774062518333
 CHARACTER_ACCEPTED_TAG = "Accepted"
 CHARACTER_REJECTED_TAG = "Rejected"
 
+# Forum where players publish their complete character stories/lore.
+CHARACTER_STORIES_CHANNEL_ID = 1543909873278787674
+
 
 # ------------------------------------------------------------
 # FORM APPLICATION SYSTEM
@@ -307,6 +312,11 @@ RACE_COUNT_LOCK = asyncio.Lock()
 REPORT_COMMANDS = {
     "!onboardingreport",
     "!onboarding-report",
+}
+
+STORY_REPORT_COMMANDS = {
+    "!storyreport",
+    "!story-report",
 }
 
 REPORT_TIMEZONE = "America/Santiago"
@@ -4857,6 +4867,10 @@ async def on_ready():
         "📊 Staff report command: !onboardingreport"
     )
 
+    print(
+        "📖 Character Stories Word command: !storyreport"
+    )
+
     print("=" * 65)
     print()
 
@@ -4963,6 +4977,317 @@ async def on_member_remove(member: discord.Member):
 # STAFF REPORT COMMAND
 # ============================================================
 
+def _word_safe_text(value) -> str:
+    """Remove control characters that cannot be stored in a DOCX file."""
+
+    if value is None:
+        return ""
+
+    text = str(value).replace("\r\n", "\n").replace("\r", "\n")
+    return "".join(
+        character
+        for character in text
+        if character in ("\n", "\t") or ord(character) >= 32
+    ).strip()
+
+
+def _application_status_label(thread: discord.Thread) -> str:
+    """Return a readable status for one Character Application thread."""
+
+    tag_names = {
+        normalize_forum_tag(tag.name)
+        for tag in thread.applied_tags
+    }
+
+    if normalize_forum_tag(CHARACTER_ACCEPTED_TAG) in tag_names:
+        return "Accepted"
+
+    if normalize_forum_tag(CHARACTER_REJECTED_TAG) in tag_names:
+        return "Rejected"
+
+    return "Pending"
+
+
+async def collect_character_applications_for_story_report():
+    """Index every Character Application by its Discord author ID."""
+
+    forum = await get_channel(CHARACTER_APPLICATION_FORUM_ID)
+    if not isinstance(forum, discord.ForumChannel):
+        raise RuntimeError("The Character Application forum could not be found.")
+
+    applications_by_author = {}
+
+    for thread in await collect_forum_threads(forum):
+        starter = await get_starter_message(thread)
+        if starter is None:
+            continue
+
+        parsed = parse_character_application(starter.content or "")
+        record = {
+            "thread_name": thread.name,
+            "url": starter.jump_url,
+            "status": _application_status_label(thread),
+            "character_name": clean_value(parsed.get("character_name") or ""),
+            "race": clean_value(parsed.get("race") or ""),
+        }
+        applications_by_author.setdefault(starter.author.id, []).append(record)
+
+    return applications_by_author
+
+
+async def collect_story_entries(channel):
+    """Collect story posts from a forum, or messages from a text channel."""
+
+    entries = []
+
+    if isinstance(channel, discord.ForumChannel):
+        threads = await collect_forum_threads(channel)
+        threads.sort(key=lambda item: item.created_at or datetime.min.replace(tzinfo=ZoneInfo("UTC")))
+
+        for thread in threads:
+            starter = await get_starter_message(thread)
+            if starter is None:
+                continue
+
+            messages = []
+            try:
+                async for item in thread.history(limit=None, oldest_first=True):
+                    if item.author.bot:
+                        continue
+                    body = _word_safe_text(item.content)
+                    attachments = [attachment.url for attachment in item.attachments]
+                    if body or attachments:
+                        messages.append({
+                            "author": item.author.display_name,
+                            "author_id": item.author.id,
+                            "created_at": item.created_at,
+                            "content": body,
+                            "attachments": attachments,
+                            "url": item.jump_url,
+                        })
+            except (discord.Forbidden, discord.HTTPException) as error:
+                print(f"⚠️ Could not read story thread '{thread.name}': {error}")
+
+            entries.append({
+                "title": thread.name,
+                "author": starter.author,
+                "created_at": starter.created_at,
+                "url": starter.jump_url,
+                "messages": messages,
+            })
+
+        return entries
+
+    if isinstance(channel, discord.TextChannel):
+        async for item in channel.history(limit=None, oldest_first=True):
+            if item.author.bot:
+                continue
+            body = _word_safe_text(item.content)
+            attachments = [attachment.url for attachment in item.attachments]
+            if not body and not attachments:
+                continue
+            entries.append({
+                "title": f"Story by {item.author.display_name}",
+                "author": item.author,
+                "created_at": item.created_at,
+                "url": item.jump_url,
+                "messages": [{
+                    "author": item.author.display_name,
+                    "author_id": item.author.id,
+                    "created_at": item.created_at,
+                    "content": body,
+                    "attachments": attachments,
+                    "url": item.jump_url,
+                }],
+            })
+        return entries
+
+    raise RuntimeError("The configured story channel is not a Forum or Text channel.")
+
+
+def build_story_report_document(entries, applications_by_author, output_path):
+    """Build the consolidated Character Stories Word document."""
+
+    document = Document()
+    section = document.sections[0]
+    section.top_margin = Inches(0.65)
+    section.bottom_margin = Inches(0.65)
+    section.left_margin = Inches(0.75)
+    section.right_margin = Inches(0.75)
+
+    styles = document.styles
+    styles["Normal"].font.name = "Aptos"
+    styles["Normal"].font.size = Pt(10.5)
+    styles["Title"].font.name = "Aptos Display"
+    styles["Title"].font.color.rgb = RGBColor(76, 45, 122)
+
+    document.add_heading("Dragon Ball: Golden Age", 0)
+    document.add_heading("Character Stories Report", level=1)
+    generated = datetime.now(ZoneInfo(REPORT_TIMEZONE))
+    document.add_paragraph(
+        f"Generated: {generated.strftime('%Y-%m-%d %H:%M %Z')}\n"
+        f"Stories collected: {len(entries)}"
+    )
+
+    document.add_heading("Index", level=1)
+    index_table = document.add_table(rows=1, cols=4)
+    index_table.style = "Table Grid"
+    for cell, label in zip(
+        index_table.rows[0].cells,
+        ("Story", "Player", "Application", "Character / Race"),
+    ):
+        cell.text = label
+
+    for entry in entries:
+        linked_apps = applications_by_author.get(entry["author"].id, [])
+        application_text = ", ".join(app["status"] for app in linked_apps) or "Not found"
+        character_text = "; ".join(
+            " / ".join(filter(None, (app["character_name"], app["race"])))
+            for app in linked_apps
+        ) or "—"
+        cells = index_table.add_row().cells
+        cells[0].text = _word_safe_text(entry["title"])
+        cells[1].text = _word_safe_text(entry["author"].display_name)
+        cells[2].text = application_text
+        cells[3].text = character_text
+
+    for position, entry in enumerate(entries):
+        document.add_page_break()
+        document.add_heading(_word_safe_text(entry["title"]) or "Untitled Story", level=1)
+
+        metadata = document.add_table(rows=0, cols=2)
+        metadata.style = "Light Shading Accent 1"
+        metadata_rows = (
+            ("Player", entry["author"].display_name),
+            ("Discord ID", str(entry["author"].id)),
+            ("Published", entry["created_at"].astimezone(ZoneInfo(REPORT_TIMEZONE)).strftime("%Y-%m-%d %H:%M %Z")),
+            ("Discord link", entry["url"]),
+        )
+        for label, value in metadata_rows:
+            cells = metadata.add_row().cells
+            cells[0].text = label
+            cells[1].text = _word_safe_text(value)
+
+        linked_apps = applications_by_author.get(entry["author"].id, [])
+        document.add_heading("Character Application", level=2)
+        if not linked_apps:
+            document.add_paragraph("No Character Application was found for this Discord user.")
+        else:
+            for app in linked_apps:
+                table = document.add_table(rows=0, cols=2)
+                table.style = "Table Grid"
+                for label, value in (
+                    ("Character", app["character_name"] or app["thread_name"]),
+                    ("Race", app["race"] or "Not detected"),
+                    ("Status", app["status"]),
+                    ("Application link", app["url"]),
+                ):
+                    cells = table.add_row().cells
+                    cells[0].text = label
+                    cells[1].text = _word_safe_text(value)
+
+        document.add_heading("Story / Lore", level=2)
+        if not entry["messages"]:
+            document.add_paragraph("No readable text or attachments were found.")
+
+        for message_index, item in enumerate(entry["messages"]):
+            if message_index > 0:
+                paragraph = document.add_paragraph()
+                run = paragraph.add_run(
+                    f"Reply by {item['author']} — "
+                    f"{item['created_at'].astimezone(ZoneInfo(REPORT_TIMEZONE)).strftime('%Y-%m-%d %H:%M')}"
+                )
+                run.bold = True
+
+            if item["content"]:
+                for block in item["content"].split("\n"):
+                    document.add_paragraph(block)
+
+            if item["attachments"]:
+                attachment_paragraph = document.add_paragraph()
+                attachment_paragraph.add_run("Attachments:\n").bold = True
+                for attachment_url in item["attachments"]:
+                    attachment_paragraph.add_run(f"{attachment_url}\n")
+
+    document.save(output_path)
+
+
+async def generate_story_report(guild: discord.Guild):
+    """Download all character stories and cross-reference applications."""
+
+    story_channel = await get_channel(CHARACTER_STORIES_CHANNEL_ID)
+    if story_channel is None or story_channel.guild.id != guild.id:
+        raise RuntimeError("The configured Character Stories channel could not be found.")
+
+    entries, applications_by_author = await asyncio.gather(
+        collect_story_entries(story_channel),
+        collect_character_applications_for_story_report(),
+    )
+
+    os.makedirs(REPORTS_DIR, exist_ok=True)
+    timestamp = datetime.now(ZoneInfo(REPORT_TIMEZONE)).strftime("%Y%m%d_%H%M%S")
+    output_path = os.path.join(REPORTS_DIR, f"character_stories_{timestamp}.docx")
+
+    await asyncio.to_thread(
+        build_story_report_document,
+        entries,
+        applications_by_author,
+        output_path,
+    )
+
+    return {"path": output_path, "total": len(entries)}
+
+
+async def handle_story_report_command(message: discord.Message):
+    """Owner-only entry point for !storyreport."""
+
+    if message.author.id != message.guild.owner_id:
+        await message.reply("❌ Only the server owner can generate the story report.")
+        return
+
+    report_key = ("stories", message.guild.id, message.author.id)
+    if report_key in REPORT_IN_PROGRESS:
+        await message.reply("⏳ A Character Stories report is already being generated.")
+        return
+
+    REPORT_IN_PROGRESS.add(report_key)
+    progress_message = None
+
+    try:
+        progress_message = await message.reply(
+            "📖 Collecting Character Stories and building the Word document..."
+        )
+        result = await generate_story_report(message.guild)
+        await message.channel.send(
+            "## 📖 Character Stories Report Ready\n\n"
+            f"**Stories collected:** `{result['total']}`\n\n"
+            "The Word file was also saved in the bot's `reports/` folder.",
+            file=discord.File(
+                result["path"],
+                filename=os.path.basename(result["path"]),
+            ),
+        )
+        if progress_message is not None:
+            try:
+                await progress_message.delete()
+            except discord.HTTPException:
+                pass
+    except Exception as error:
+        print(f"❌ Character Stories report generation failed: {error!r}")
+        error_text = (
+            "❌ **Golden Age Manager could not generate the Character Stories report.**\n\n"
+            f"`{type(error).__name__}: {error}`"
+        )
+        if progress_message is not None:
+            try:
+                await progress_message.edit(content=error_text)
+            except discord.HTTPException:
+                await message.channel.send(error_text)
+        else:
+            await message.channel.send(error_text)
+    finally:
+        REPORT_IN_PROGRESS.discard(report_key)
+
 @client.event
 async def on_message(message: discord.Message):
     """
@@ -4982,6 +5307,10 @@ async def on_message(message: discord.Message):
     command = normalize(
         message.content or ""
     )
+
+    if command in STORY_REPORT_COMMANDS:
+        await handle_story_report_command(message)
+        return
 
     if command not in REPORT_COMMANDS:
         return
