@@ -1,3 +1,4 @@
 discord.py
 python-dotenv
 openpyxl>=3.1,<4
+python-docx>=1.2,<2
