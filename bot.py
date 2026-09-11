@@ -1,5 +1,5 @@
-# Golden Age Manager v7.1
-# Adds Form Applications + mandatory `Declined:` Staff feedback with contextual suggestions.
+# Golden Age Manager v7.6
+# Adds clearer Character Stories report coverage metrics (stories vs unique players/characters).
 import os
 import re
 import json
@@ -5105,6 +5105,37 @@ async def collect_story_entries(channel):
     raise RuntimeError("The configured story channel is not a Forum or Text channel.")
 
 
+def get_story_report_stats(entries, applications_by_author):
+    """Return story/post and player coverage metrics for the report."""
+
+    player_ids = {
+        entry["author"].id
+        for entry in entries
+        if entry.get("author") is not None
+    }
+
+    accepted_application_keys = set()
+
+    for user_id in player_ids:
+        for app in applications_by_author.get(user_id, []):
+            if app.get("status") != "Accepted":
+                continue
+
+            # Application URLs are unique per Discord thread. Keep a fallback
+            # key for safety in case an old record does not have a URL.
+            application_key = (
+                app.get("url")
+                or f"{user_id}:{app.get('thread_name', '')}:{app.get('character_name', '')}"
+            )
+            accepted_application_keys.add(application_key)
+
+    return {
+        "stories": len(entries),
+        "unique_players": len(player_ids),
+        "accepted_characters": len(accepted_application_keys),
+    }
+
+
 def build_story_report_document(entries, applications_by_author, output_path):
     """Build the consolidated Character Stories Word document."""
 
@@ -5124,10 +5155,18 @@ def build_story_report_document(entries, applications_by_author, output_path):
     document.add_heading("Dragon Ball: Golden Age", 0)
     document.add_heading("Character Stories Report", level=1)
     generated = datetime.now(ZoneInfo(REPORT_TIMEZONE))
+    stats = get_story_report_stats(entries, applications_by_author)
     document.add_paragraph(
         f"Generated: {generated.strftime('%Y-%m-%d %H:%M %Z')}\n"
-        f"Stories collected: {len(entries)}"
+        f"Stories collected: {stats['stories']}\n"
+        f"Unique players represented: {stats['unique_players']}\n"
+        f"Accepted characters represented: {stats['accepted_characters']}"
     )
+
+    note = document.add_paragraph(
+        "Note: Stories are individual posts/threads. One player may have multiple stories."
+    )
+    note.runs[0].italic = True
 
     document.add_heading("Index", level=1)
     index_table = document.add_table(rows=1, cols=4)
@@ -5228,6 +5267,8 @@ async def generate_story_report(guild: discord.Guild):
     timestamp = datetime.now(ZoneInfo(REPORT_TIMEZONE)).strftime("%Y%m%d_%H%M%S")
     output_path = os.path.join(REPORTS_DIR, f"character_stories_{timestamp}.docx")
 
+    stats = get_story_report_stats(entries, applications_by_author)
+
     await asyncio.to_thread(
         build_story_report_document,
         entries,
@@ -5235,7 +5276,12 @@ async def generate_story_report(guild: discord.Guild):
         output_path,
     )
 
-    return {"path": output_path, "total": len(entries)}
+    return {
+        "path": output_path,
+        "total": stats["stories"],
+        "unique_players": stats["unique_players"],
+        "accepted_characters": stats["accepted_characters"],
+    }
 
 
 async def handle_story_report_command(message: discord.Message):
@@ -5260,7 +5306,10 @@ async def handle_story_report_command(message: discord.Message):
         result = await generate_story_report(message.guild)
         await message.channel.send(
             "## 📖 Character Stories Report Ready\n\n"
-            f"**Stories collected:** `{result['total']}`\n\n"
+            f"**Stories collected:** `{result['total']}`\n"
+            f"**Unique players represented:** `{result['unique_players']}`\n"
+            f"**Accepted characters represented:** `{result['accepted_characters']}`\n\n"
+            "ℹ️ Stories are individual posts/threads, so one player may have multiple stories.\n\n"
             "The Word file was also saved in the bot's `reports/` folder.",
             file=discord.File(
                 result["path"],
