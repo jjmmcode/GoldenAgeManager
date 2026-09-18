@@ -1,9 +1,12 @@
-# Golden Age Manager v7.6
-# Adds clearer Character Stories report coverage metrics (stories vs unique players/characters).
+# Golden Age Manager v7.7
+# Adds one compact Word document per character, delivered in a ZIP archive.
 import os
 import re
 import json
 import asyncio
+import tempfile
+import unicodedata
+import zipfile
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -317,6 +320,11 @@ REPORT_COMMANDS = {
 STORY_REPORT_COMMANDS = {
     "!storyreport",
     "!story-report",
+}
+
+STORY_REPORT_ALL_COMMANDS = {
+    "!storyreportall",
+    "!story-report-all",
 }
 
 REPORT_TIMEZONE = "America/Santiago"
@@ -4868,7 +4876,11 @@ async def on_ready():
     )
 
     print(
-        "📖 Character Stories Word command: !storyreport"
+        "📚 Per-character Story ZIP command: !storyreport"
+    )
+
+    print(
+        "📖 Consolidated Story Word command: !storyreportall"
     )
 
     print("=" * 65)
@@ -5029,6 +5041,7 @@ async def collect_character_applications_for_story_report():
             "status": _application_status_label(thread),
             "character_name": clean_value(parsed.get("character_name") or ""),
             "race": clean_value(parsed.get("race") or ""),
+            "application": parsed,
         }
         applications_by_author.setdefault(starter.author.id, []).append(record)
 
@@ -5052,7 +5065,10 @@ async def collect_story_entries(channel):
             messages = []
             try:
                 async for item in thread.history(limit=None, oldest_first=True):
-                    if item.author.bot:
+                    # A story thread may contain Staff feedback or comments
+                    # from other players. Only the original author's posts
+                    # belong in that character's narrative dossier.
+                    if item.author.bot or item.author.id != starter.author.id:
                         continue
                     body = _word_safe_text(item.content)
                     attachments = [attachment.url for attachment in item.attachments]
@@ -5251,6 +5267,304 @@ def build_story_report_document(entries, applications_by_author, output_path):
     document.save(output_path)
 
 
+def _matching_text(value) -> str:
+    """Normalize names and thread titles for conservative matching."""
+
+    value = unicodedata.normalize("NFKD", _word_safe_text(value).casefold())
+    value = "".join(character for character in value if not unicodedata.combining(character))
+    return re.sub(r"[^a-z0-9]+", " ", value).strip()
+
+
+def _safe_report_filename(value: str, fallback: str = "character") -> str:
+    """Return a Windows/ZIP-safe filename component."""
+
+    value = unicodedata.normalize("NFKD", _word_safe_text(value))
+    value = "".join(character for character in value if not unicodedata.combining(character))
+    value = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", value)
+    value = re.sub(r"\s+", "_", value.strip())
+    value = re.sub(r"_+", "_", value).strip("._ ")
+    return (value or fallback)[:80]
+
+
+def choose_story_application(entry, applications_by_author):
+    """
+    Match one story to one Character Application without guessing.
+
+    Accepted applications are preferred. A single candidate is safe to use.
+    When a player owns several characters, the character name must appear in
+    the story thread title. Ambiguous stories are returned as unresolved.
+    """
+
+    linked_apps = list(applications_by_author.get(entry["author"].id, []))
+    if not linked_apps:
+        return None
+
+    accepted_apps = [app for app in linked_apps if app.get("status") == "Accepted"]
+    candidates = accepted_apps or linked_apps
+
+    if len(candidates) == 1:
+        return candidates[0]
+
+    title = _matching_text(entry.get("title") or "")
+    matches = []
+
+    for app in candidates:
+        character_name = _matching_text(
+            app.get("character_name") or app.get("thread_name") or ""
+        )
+        if character_name and character_name in title:
+            matches.append((len(character_name), app))
+
+    if not matches:
+        return None
+
+    # Prefer the longest matching name (for example, "Slug Jr" over "Slug").
+    matches.sort(key=lambda item: item[0], reverse=True)
+    if len(matches) == 1 or matches[0][0] > matches[1][0]:
+        return matches[0][1]
+
+    return None
+
+
+def group_stories_by_character(entries, applications_by_author):
+    """Group story threads into resolved character dossiers."""
+
+    groups = {}
+
+    for entry in entries:
+        application = choose_story_application(entry, applications_by_author)
+
+        if application is not None:
+            application_key = (
+                application.get("url")
+                or f"{entry['author'].id}:{application.get('thread_name', '')}"
+            )
+            key = ("character", application_key)
+            character_name = (
+                application.get("character_name")
+                or application.get("thread_name")
+                or entry["title"]
+            )
+            race = application.get("race") or "Unknown Race"
+            unresolved = False
+        else:
+            # All ambiguous stories belonging to the same player are kept
+            # together for manual review instead of being assigned at random.
+            key = ("unresolved", entry["author"].id)
+            character_name = entry["author"].display_name
+            race = "Unknown character"
+            unresolved = True
+
+        group = groups.setdefault(key, {
+            "character_name": character_name,
+            "race": race,
+            "author": entry["author"],
+            "application": application,
+            "entries": [],
+            "unresolved": unresolved,
+        })
+        group["entries"].append(entry)
+
+    return list(groups.values())
+
+
+def _add_compact_label(document, label: str, value: str):
+    paragraph = document.add_paragraph()
+    paragraph.paragraph_format.space_after = Pt(1)
+    label_run = paragraph.add_run(f"{label}: ")
+    label_run.bold = True
+    paragraph.add_run(_word_safe_text(value) or "—")
+    return paragraph
+
+
+def build_character_story_document(group, output_path):
+    """Build one compact Word dossier for one character."""
+
+    document = Document()
+    section = document.sections[0]
+    section.top_margin = Inches(0.55)
+    section.bottom_margin = Inches(0.55)
+    section.left_margin = Inches(0.65)
+    section.right_margin = Inches(0.65)
+
+    styles = document.styles
+    normal_style = styles["Normal"]
+    normal_style.font.name = "Aptos"
+    normal_style.font.size = Pt(9)
+    normal_style.paragraph_format.space_before = Pt(0)
+    normal_style.paragraph_format.space_after = Pt(2)
+    normal_style.paragraph_format.line_spacing = 1
+
+    styles["Title"].font.name = "Aptos Display"
+    styles["Title"].font.size = Pt(22)
+    styles["Title"].font.color.rgb = RGBColor(76, 45, 122)
+
+    for heading_name, size in (("Heading 1", 15), ("Heading 2", 12)):
+        styles[heading_name].font.name = "Aptos Display"
+        styles[heading_name].font.size = Pt(size)
+        styles[heading_name].paragraph_format.space_before = Pt(7)
+        styles[heading_name].paragraph_format.space_after = Pt(3)
+
+    document_title = (
+        f"Unresolved Stories — {group['author'].display_name}"
+        if group["unresolved"]
+        else group["character_name"]
+    )
+    document.add_heading(_word_safe_text(document_title), 0)
+    subtitle = document.add_paragraph()
+    subtitle.paragraph_format.space_after = Pt(5)
+    subtitle_run = subtitle.add_run(
+        f"{_word_safe_text(group['race'])} • {_word_safe_text(group['author'].display_name)}"
+    )
+    subtitle_run.bold = True
+
+    _add_compact_label(document, "Discord ID", str(group["author"].id))
+    _add_compact_label(document, "Stories included", str(len(group["entries"])))
+
+    application = group.get("application")
+    document.add_heading("Character Application", level=1)
+
+    if application is None:
+        warning = document.add_paragraph(
+            "This player's story could not be matched safely to one Character Application. "
+            "Review the Discord links manually before using this dossier for evaluation."
+        )
+        if warning.runs:
+            warning.runs[0].bold = True
+    else:
+        _add_compact_label(document, "Status", application.get("status") or "Unknown")
+        _add_compact_label(document, "Application link", application.get("url") or "")
+
+        parsed = application.get("application") or {}
+        application_fields = (
+            ("Alias", parsed.get("alias")),
+            ("Class", parsed.get("class")),
+            ("Age", parsed.get("age")),
+            ("Sex", parsed.get("sex")),
+            ("Family", parsed.get("family")),
+            ("Alignment", parsed.get("alignment")),
+            ("Fighting style", parsed.get("fighting_style")),
+        )
+        for label, value in application_fields:
+            if value:
+                _add_compact_label(document, label, value)
+
+        application_backstory = _word_safe_text(parsed.get("backstory") or "")
+        if application_backstory:
+            document.add_heading("Application Backstory", level=2)
+            paragraph = document.add_paragraph()
+            paragraph.add_run(application_backstory)
+
+    document.add_heading("Stories / Roleplay Development", level=1)
+
+    for story_number, entry in enumerate(group["entries"], start=1):
+        heading = document.add_heading(
+            f"{story_number}. {_word_safe_text(entry['title']) or 'Untitled Story'}",
+            level=2,
+        )
+        heading.paragraph_format.keep_with_next = True
+
+        info = document.add_paragraph()
+        info.paragraph_format.space_after = Pt(3)
+        info_run = info.add_run(
+            f"{entry['created_at'].astimezone(ZoneInfo(REPORT_TIMEZONE)).strftime('%Y-%m-%d')}"
+            f" • {entry['url']}"
+        )
+        info_run.italic = True
+        info_run.font.size = Pt(8)
+
+        if not entry["messages"]:
+            document.add_paragraph("No readable text or attachments were found.")
+            continue
+
+        for message_index, item in enumerate(entry["messages"]):
+            if message_index > 0:
+                continuation = document.add_paragraph()
+                continuation.paragraph_format.space_before = Pt(4)
+                continuation.paragraph_format.space_after = Pt(1)
+                run = continuation.add_run(
+                    "Author continuation — "
+                    f"{item['created_at'].astimezone(ZoneInfo(REPORT_TIMEZONE)).strftime('%Y-%m-%d %H:%M')}"
+                )
+                run.bold = True
+                run.font.size = Pt(8)
+
+            if item["content"]:
+                # Preserve Discord line breaks inside one Word paragraph. This
+                # prevents every blank line from adding Word paragraph spacing.
+                paragraph = document.add_paragraph()
+                paragraph.paragraph_format.space_after = Pt(3)
+                paragraph.add_run(item["content"])
+
+            if item["attachments"]:
+                attachment_paragraph = document.add_paragraph()
+                attachment_paragraph.paragraph_format.space_after = Pt(2)
+                attachment_paragraph.add_run("Attachments: ").bold = True
+                attachment_paragraph.add_run(" | ".join(item["attachments"]))
+
+    document.save(output_path)
+
+
+def build_character_story_zip(groups, output_path):
+    """Build every character DOCX and package them into one ZIP archive."""
+
+    used_names = set()
+
+    with tempfile.TemporaryDirectory(prefix="golden_age_story_report_") as temp_dir:
+        with zipfile.ZipFile(output_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for group in groups:
+                if group["unresolved"]:
+                    base_name = _safe_report_filename(
+                        f"Unresolved_{group['author'].display_name}"
+                    )
+                else:
+                    base_name = _safe_report_filename(
+                        f"Character_{group['character_name']}_{group['race']}"
+                    )
+                filename = f"{base_name}.docx"
+                suffix = 2
+
+                while filename.casefold() in used_names:
+                    filename = f"{base_name}_{suffix}.docx"
+                    suffix += 1
+
+                used_names.add(filename.casefold())
+                document_path = os.path.join(temp_dir, filename)
+                build_character_story_document(group, document_path)
+                archive.write(document_path, arcname=filename)
+
+
+async def generate_character_story_zip(guild: discord.Guild):
+    """Generate a ZIP containing one compact DOCX per resolved character."""
+
+    story_channel = await get_channel(CHARACTER_STORIES_CHANNEL_ID)
+    if story_channel is None or story_channel.guild.id != guild.id:
+        raise RuntimeError("The configured Character Stories channel could not be found.")
+
+    entries, applications_by_author = await asyncio.gather(
+        collect_story_entries(story_channel),
+        collect_character_applications_for_story_report(),
+    )
+    groups = group_stories_by_character(entries, applications_by_author)
+
+    os.makedirs(REPORTS_DIR, exist_ok=True)
+    timestamp = datetime.now(ZoneInfo(REPORT_TIMEZONE)).strftime("%Y%m%d_%H%M%S")
+    output_path = os.path.join(REPORTS_DIR, f"character_story_files_{timestamp}.zip")
+
+    await asyncio.to_thread(build_character_story_zip, groups, output_path)
+
+    unresolved_groups = sum(1 for group in groups if group["unresolved"])
+    resolved_groups = len(groups) - unresolved_groups
+
+    return {
+        "path": output_path,
+        "stories": len(entries),
+        "documents": len(groups),
+        "resolved": resolved_groups,
+        "unresolved": unresolved_groups,
+    }
+
+
 async def generate_story_report(guild: discord.Guild):
     """Download all character stories and cross-reference applications."""
 
@@ -5285,15 +5599,15 @@ async def generate_story_report(guild: discord.Guild):
 
 
 async def handle_story_report_command(message: discord.Message):
-    """Owner-only entry point for !storyreport."""
+    """Owner-only entry point for the per-character ZIP report."""
 
     if message.author.id != message.guild.owner_id:
         await message.reply("❌ Only the server owner can generate the story report.")
         return
 
-    report_key = ("stories", message.guild.id, message.author.id)
+    report_key = ("stories_zip", message.guild.id, message.author.id)
     if report_key in REPORT_IN_PROGRESS:
-        await message.reply("⏳ A Character Stories report is already being generated.")
+        await message.reply("⏳ A per-character story report is already being generated.")
         return
 
     REPORT_IN_PROGRESS.add(report_key)
@@ -5301,15 +5615,70 @@ async def handle_story_report_command(message: discord.Message):
 
     try:
         progress_message = await message.reply(
-            "📖 Collecting Character Stories and building the Word document..."
+            "📚 Collecting Character Stories and building one Word file per character..."
+        )
+        result = await generate_character_story_zip(message.guild)
+        await message.channel.send(
+            "## 📚 Character Story Files Ready\n\n"
+            f"**Stories collected:** `{result['stories']}`\n"
+            f"**Word documents created:** `{result['documents']}`\n"
+            f"**Characters matched automatically:** `{result['resolved']}`\n"
+            f"**Players requiring manual review:** `{result['unresolved']}`\n\n"
+            "The ZIP contains one compact Word document per character. "
+            "Ambiguous cases are labeled `Unresolved` and were not assigned automatically.\n\n"
+            "The ZIP was also saved in the bot's `reports/` folder.",
+            file=discord.File(
+                result["path"],
+                filename=os.path.basename(result["path"]),
+            ),
+        )
+        if progress_message is not None:
+            try:
+                await progress_message.delete()
+            except discord.HTTPException:
+                pass
+    except Exception as error:
+        print(f"❌ Per-character story report generation failed: {error!r}")
+        error_text = (
+            "❌ **Golden Age Manager could not generate the per-character story report.**\n\n"
+            f"`{type(error).__name__}: {error}`"
+        )
+        if progress_message is not None:
+            try:
+                await progress_message.edit(content=error_text)
+            except discord.HTTPException:
+                await message.channel.send(error_text)
+        else:
+            await message.channel.send(error_text)
+    finally:
+        REPORT_IN_PROGRESS.discard(report_key)
+
+
+async def handle_story_report_all_command(message: discord.Message):
+    """Owner-only entry point for the legacy consolidated Word report."""
+
+    if message.author.id != message.guild.owner_id:
+        await message.reply("❌ Only the server owner can generate the story report.")
+        return
+
+    report_key = ("stories_all", message.guild.id, message.author.id)
+    if report_key in REPORT_IN_PROGRESS:
+        await message.reply("⏳ A consolidated Character Stories report is already being generated.")
+        return
+
+    REPORT_IN_PROGRESS.add(report_key)
+    progress_message = None
+
+    try:
+        progress_message = await message.reply(
+            "📖 Collecting Character Stories and building the consolidated Word document..."
         )
         result = await generate_story_report(message.guild)
         await message.channel.send(
-            "## 📖 Character Stories Report Ready\n\n"
+            "## 📖 Consolidated Character Stories Report Ready\n\n"
             f"**Stories collected:** `{result['total']}`\n"
             f"**Unique players represented:** `{result['unique_players']}`\n"
             f"**Accepted characters represented:** `{result['accepted_characters']}`\n\n"
-            "ℹ️ Stories are individual posts/threads, so one player may have multiple stories.\n\n"
             "The Word file was also saved in the bot's `reports/` folder.",
             file=discord.File(
                 result["path"],
@@ -5322,9 +5691,9 @@ async def handle_story_report_command(message: discord.Message):
             except discord.HTTPException:
                 pass
     except Exception as error:
-        print(f"❌ Character Stories report generation failed: {error!r}")
+        print(f"❌ Consolidated story report generation failed: {error!r}")
         error_text = (
-            "❌ **Golden Age Manager could not generate the Character Stories report.**\n\n"
+            "❌ **Golden Age Manager could not generate the consolidated story report.**\n\n"
             f"`{type(error).__name__}: {error}`"
         )
         if progress_message is not None:
@@ -5359,6 +5728,10 @@ async def on_message(message: discord.Message):
 
     if command in STORY_REPORT_COMMANDS:
         await handle_story_report_command(message)
+        return
+
+    if command in STORY_REPORT_ALL_COMMANDS:
+        await handle_story_report_all_command(message)
         return
 
     if command not in REPORT_COMMANDS:
