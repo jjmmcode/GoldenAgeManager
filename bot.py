@@ -1,5 +1,6 @@
-# Golden Age Manager v7.7
-# Adds one compact Word document per character, delivered in a ZIP archive.
+# Golden Age Manager v7.8
+# Keeps Mentor List / Available Abilities synchronized with active Discord members.
+# Preserves the v7.7 per-character Story ZIP system.
 import os
 import re
 import json
@@ -3250,6 +3251,11 @@ async def rebuild_approved_mentor_records():
     Rebuild the public mentor directory from the current approval tags on
     Mentor Applications (including archived threads).
 
+    Only mentors whose Discord account is STILL a member of this server are
+    considered active. Historical Mentor Applications remain untouched, but a
+    departed/kicked member no longer appears in Mentor List and their mentor
+    ability becomes available again.
+
     The source application is authoritative. The approved-mentors profile is
     a presentation copy and can be recreated if Staff deletes it by mistake.
     """
@@ -3265,6 +3271,8 @@ async def rebuild_approved_mentor_records():
         )
         return
 
+    guild = forum.guild
+
     rejected_name = normalize(MENTOR_REJECTED_TAG)
     source_to_destination = {
         normalize(source): destination
@@ -3273,6 +3281,7 @@ async def rebuild_approved_mentor_records():
 
     approved_threads_seen = 0
     skipped = 0
+    departed_mentors = 0
 
     for thread in await collect_forum_threads(forum):
         tag_names = {
@@ -3303,12 +3312,30 @@ async def rebuild_approved_mentor_records():
             )
             continue
 
+        # Active-roster validation:
+        # Keep the historical application, but do not expose a mentor publicly
+        # if the Discord account no longer exists in the guild.
+        member = await get_guild_member(
+            guild,
+            starter_message.author.id
+        )
+
+        if member is None:
+            departed_mentors += 1
+            print(
+                f"🚪 Inactive mentor excluded: '{thread.name}' "
+                f"(Discord user {starter_message.author.id} is no longer "
+                "in the server)."
+            )
+            continue
+
         application = parse_mentor_application(
             starter_message.content or ""
         )
 
         character = (
             application.get("character")
+            or member.display_name
             or starter_message.author.display_name
             or thread.name
         )
@@ -3316,7 +3343,7 @@ async def rebuild_approved_mentor_records():
 
         APPROVED_MENTOR_RECORDS[thread.id] = {
             "user_id": starter_message.author.id,
-            "author_name": starter_message.author.display_name,
+            "author_name": member.display_name,
             "character": character,
             "skill": skill,
             "type": mentorship_type,
@@ -3324,10 +3351,16 @@ async def rebuild_approved_mentor_records():
         }
 
     print(
-        f"🎓 Approved Mentor Applications counted: "
+        f"🎓 Active Approved Mentor Applications counted: "
         f"{len(APPROVED_MENTOR_RECORDS)} mentor(s) "
         f"from {approved_threads_seen} approved thread(s)."
     )
+
+    if departed_mentors:
+        print(
+            f"🚪 Excluded {departed_mentors} approved mentor application(s) "
+            "because the player is no longer in the server."
+        )
 
     if skipped:
         print(
@@ -3344,7 +3377,7 @@ async def rebuild_approved_mentor_records():
             f"{mentor_type}: {count}"
             for mentor_type, count in sorted(diagnostic_counts.items())
         )
-        print(f"🎓 Mentor breakdown: {diagnostic_text}")
+        print(f"🎓 Active mentor breakdown: {diagnostic_text}")
 
 
 def _clean_mentor_skill_name(skill: str, thread_name: str) -> str:
@@ -4861,6 +4894,7 @@ async def on_ready():
         print("🤖 Human/Android race disambiguation enabled (v7.5).")
         print("🟠 Saiyan race cap set to 11 (v7.5).")
         print("🧠 Robust compact-field race parsing enabled (v7.5).")
+        print("🎓 Active Mentor roster reconciliation enabled (v7.8).")
         await sync_all_community_access()
         INITIAL_ACCESS_SYNC_DONE = True
         print()
@@ -4966,10 +5000,11 @@ async def on_member_update(
 @client.event
 async def on_member_remove(member: discord.Member):
     """
-    Immediately frees race slots when a player leaves the Discord server.
+    Immediately reconcile race slots AND the active Mentor directory when a
+    player leaves/is removed from the Discord server.
 
-    Accepted application history is preserved, but departed members no longer
-    count toward the public Race Count.
+    Historical Character/Mentor Applications are preserved. They simply stop
+    consuming an active race slot / mentor slot while the member is absent.
     """
 
     if member.bot:
@@ -4979,9 +5014,46 @@ async def on_member_remove(member: discord.Member):
         reason=f"member left: {member}"
     )
 
+    # Rebuild active mentors from approved applications + current guild roster.
+    # If the departed member was a mentor, they disappear from Mentor List and
+    # their ability automatically returns to Available Mentor Abilities.
+    await rebuild_approved_mentor_records()
+    await update_mentor_list_message(
+        reason=f"member left: {member}"
+    )
+    await update_available_abilities_message(
+        reason=f"member left: {member}"
+    )
+
     print(
         f"🚪 Member left the server: {member}. "
-        "Race Count reconciled against the active roster."
+        "Race Count + Mentor List + Available Abilities reconciled."
+    )
+
+
+@client.event
+async def on_member_join(member: discord.Member):
+    """
+    Reconcile mentors when a member joins/rejoins.
+
+    If an old Mentor Application is still approved, the mentor can return to
+    the public Mentor List automatically after rejoining the server.
+    """
+
+    if member.bot:
+        return
+
+    await rebuild_approved_mentor_records()
+    await update_mentor_list_message(
+        reason=f"member joined: {member}"
+    )
+    await update_available_abilities_message(
+        reason=f"member joined: {member}"
+    )
+
+    print(
+        f"👋 Member joined the server: {member}. "
+        "Mentor List + Available Abilities reconciled."
     )
 
 
