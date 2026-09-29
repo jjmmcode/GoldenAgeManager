@@ -1,6 +1,6 @@
-# Golden Age Manager v7.8
-# Keeps Mentor List / Available Abilities synchronized with active Discord members.
-# Preserves the v7.7 per-character Story ZIP system.
+# Golden Age Manager v7.9
+# Deletes managed forum publications for members who leave/are removed.
+# Keeps Race Count, Mentor List and Available Abilities synchronized afterward.
 import os
 import re
 import json
@@ -1139,6 +1139,259 @@ async def collect_forum_threads(forum: discord.ForumChannel):
         )
 
     return threads
+
+
+# ============================================================
+# DEPARTED MEMBER PUBLICATION CLEANUP
+# ============================================================
+
+# Source forums whose user-owned threads should be removed when the owner
+# leaves/is kicked from the server. Bot-generated approved mirrors are deleted
+# through PROCESSED_APPLICATIONS before the source thread is removed.
+MANAGED_DEPARTURE_FORUMS = {
+    "mentor": MENTOR_APPLICATION_FORUM_ID,
+    "character": CHARACTER_APPLICATION_FORUM_ID,
+    "form": FORM_APPLICATION_FORUM_ID,
+    "story": CHARACTER_STORIES_CHANNEL_ID,
+}
+
+
+async def _delete_managed_thread(
+    thread: discord.Thread,
+    *,
+    label: str,
+) -> bool:
+    """Delete one managed Discord thread with safe diagnostics."""
+
+    try:
+        await thread.delete(
+            reason=f"Golden Age Manager: departed member cleanup ({label})"
+        )
+        print(
+            f"🗑️ Deleted {label}: "
+            f"'{thread.name}' ({thread.id})."
+        )
+        return True
+
+    except discord.NotFound:
+        return False
+
+    except discord.Forbidden:
+        print(
+            f"❌ Could not delete {label} '{thread.name}'. "
+            "Check Manage Threads / Manage Channels permissions."
+        )
+        return False
+
+    except discord.HTTPException as error:
+        print(
+            f"❌ Discord API error deleting {label} "
+            f"'{thread.name}': {error}"
+        )
+        return False
+
+
+async def _delete_processed_destination_for_source(
+    application_type: str,
+    source_thread_id: int,
+) -> tuple[bool, bool]:
+    """
+    Delete the bot-generated approved mirror associated with one source
+    application and remove its processed_applications.json record.
+
+    Returns:
+        (destination_deleted, state_changed)
+    """
+
+    if application_type not in {"mentor", "character", "form"}:
+        return False, False
+
+    applications = PROCESSED_APPLICATIONS.setdefault(
+        application_type,
+        {}
+    )
+
+    record = applications.get(
+        str(source_thread_id)
+    )
+
+    if not isinstance(record, dict):
+        return False, False
+
+    destination_deleted = False
+    destination_thread_id = record.get(
+        "destination_thread_id"
+    )
+
+    if destination_thread_id:
+        destination = client.get_channel(
+            int(destination_thread_id)
+        )
+
+        if destination is None:
+            try:
+                destination = await client.fetch_channel(
+                    int(destination_thread_id)
+                )
+            except (
+                discord.NotFound,
+                discord.Forbidden,
+                discord.HTTPException,
+            ):
+                destination = None
+
+        if isinstance(destination, discord.Thread):
+            destination_deleted = await _delete_managed_thread(
+                destination,
+                label=f"approved-{application_type} mirror",
+            )
+
+    # The source is being removed regardless, so its processed marker must not
+    # survive and point to a deleted/nonexistent application.
+    applications.pop(
+        str(source_thread_id),
+        None
+    )
+
+    return destination_deleted, True
+
+
+async def cleanup_departed_member_publications(
+    guild: discord.Guild,
+    *,
+    user_id: int | None = None,
+    reason: str = "departed member cleanup",
+):
+    """
+    Delete managed forum publications owned by members who are no longer in
+    the server.
+
+    If user_id is provided, only that departed member is scanned (used by
+    on_member_remove). If omitted, every managed source forum is audited
+    against the current guild roster (used at startup).
+
+    Deleted content:
+      - #mentor-application threads
+      - their bot-generated #approved-mentors mirrors
+      - #character-application threads
+      - their bot-generated #approved-characters mirrors
+      - #form-application threads
+      - their bot-generated #approved-forms mirrors
+      - Character Stories forum threads, when the configured stories channel
+        is a Discord ForumChannel
+
+    Ordinary chat messages and unrelated channels are never touched.
+    """
+
+    stats = {
+        "source_threads": 0,
+        "approved_mirrors": 0,
+        "members": set(),
+        "state_changed": False,
+    }
+
+    for application_type, channel_id in MANAGED_DEPARTURE_FORUMS.items():
+        channel = await get_channel(
+            channel_id
+        )
+
+        # Character Stories may be configured as a regular text channel.
+        # v7.9 intentionally deletes only managed FORUM publications, not
+        # arbitrary chat history.
+        if not isinstance(channel, discord.ForumChannel):
+            if application_type != "story":
+                print(
+                    f"⚠️ Departure cleanup skipped {application_type}: "
+                    "configured channel is not a forum."
+                )
+            continue
+
+        threads = await collect_forum_threads(
+            channel
+        )
+
+        for thread in threads:
+            starter = await get_starter_message(
+                thread
+            )
+
+            if starter is None or starter.author.bot:
+                continue
+
+            owner_id = starter.author.id
+
+            if user_id is not None:
+                if owner_id != user_id:
+                    continue
+                # on_member_remove already establishes that this user departed.
+                owner_is_departed = True
+            else:
+                member = await get_guild_member(
+                    guild,
+                    owner_id
+                )
+                owner_is_departed = (
+                    member is None
+                )
+
+            if not owner_is_departed:
+                continue
+
+            stats["members"].add(
+                owner_id
+            )
+
+            if application_type in {
+                "mentor",
+                "character",
+                "form",
+            }:
+                (
+                    mirror_deleted,
+                    state_changed,
+                ) = await _delete_processed_destination_for_source(
+                    application_type,
+                    thread.id,
+                )
+
+                if mirror_deleted:
+                    stats["approved_mirrors"] += 1
+
+                if state_changed:
+                    stats["state_changed"] = True
+
+            deleted = await _delete_managed_thread(
+                thread,
+                label=f"{application_type} source publication",
+            )
+
+            if deleted:
+                stats["source_threads"] += 1
+
+    if stats["state_changed"]:
+        save_processed_applications()
+
+    if (
+        stats["source_threads"]
+        or stats["approved_mirrors"]
+    ):
+        print(
+            f"🧹 Departure cleanup ({reason}): "
+            f"{stats['source_threads']} source publication(s) + "
+            f"{stats['approved_mirrors']} approved mirror(s) deleted "
+            f"for {len(stats['members'])} departed member(s)."
+        )
+    else:
+        print(
+            f"🧹 Departure cleanup ({reason}): "
+            "no stale managed publications found."
+        )
+
+    return {
+        "source_threads": stats["source_threads"],
+        "approved_mirrors": stats["approved_mirrors"],
+        "members": len(stats["members"]),
+    }
 
 
 def parse_mutant_application(content: str):
@@ -4879,6 +5132,14 @@ async def on_ready():
     global INITIAL_ACCESS_SYNC_DONE
 
     if not INITIAL_ACCESS_SYNC_DONE:
+        # First purge stale managed publications left behind while the bot was
+        # offline. This also removes their bot-generated approved mirrors.
+        for guild in client.guilds:
+            await cleanup_departed_member_publications(
+                guild,
+                reason="startup roster audit",
+            )
+
         await rebuild_approved_mentor_records()
         await update_mentor_list_message(reason="startup")
         await update_available_abilities_message(reason="startup")
@@ -4894,7 +5155,8 @@ async def on_ready():
         print("🤖 Human/Android race disambiguation enabled (v7.5).")
         print("🟠 Saiyan race cap set to 11 (v7.5).")
         print("🧠 Robust compact-field race parsing enabled (v7.5).")
-        print("🎓 Active Mentor roster reconciliation enabled (v7.8).")
+        print("🎓 Active Mentor roster reconciliation enabled (v7.9).")
+        print("🧹 Departed-member publication cleanup enabled (v7.9).")
         await sync_all_community_access()
         INITIAL_ACCESS_SYNC_DONE = True
         print()
@@ -5000,23 +5262,30 @@ async def on_member_update(
 @client.event
 async def on_member_remove(member: discord.Member):
     """
-    Immediately reconcile race slots AND the active Mentor directory when a
-    player leaves/is removed from the Discord server.
+    Purge managed publications when a player leaves/is removed, then rebuild
+    every public directory/count that depends on those applications.
 
-    Historical Character/Mentor Applications are preserved. They simply stop
-    consuming an active race slot / mentor slot while the member is absent.
+    This event is fired for normal leaves, kicks and bans as a member removal.
     """
 
     if member.bot:
         return
 
+    await cleanup_departed_member_publications(
+        member.guild,
+        user_id=member.id,
+        reason=f"member left: {member}",
+    )
+
+    # Character source applications may have been deleted, so rebuild the
+    # accepted-character cache before recalculating Race Count.
+    await rebuild_approved_character_cache()
     await update_race_count_message(
         reason=f"member left: {member}"
     )
 
-    # Rebuild active mentors from approved applications + current guild roster.
-    # If the departed member was a mentor, they disappear from Mentor List and
-    # their ability automatically returns to Available Mentor Abilities.
+    # Mentor applications/mirrors may also have been deleted. Rebuilding here
+    # automatically frees their abilities in Available Mentor Abilities.
     await rebuild_approved_mentor_records()
     await update_mentor_list_message(
         reason=f"member left: {member}"
@@ -5027,7 +5296,7 @@ async def on_member_remove(member: discord.Member):
 
     print(
         f"🚪 Member left the server: {member}. "
-        "Race Count + Mentor List + Available Abilities reconciled."
+        "Managed publications deleted and public registries reconciled."
     )
 
 
