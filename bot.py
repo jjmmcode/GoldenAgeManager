@@ -1,6 +1,6 @@
-# Golden Age Manager v7.9
-# Deletes managed forum publications for members who leave/are removed.
-# Keeps Race Count, Mentor List and Available Abilities synchronized afterward.
+# Golden Age Manager v8.0
+# Adds Grey Race and Demon Race character support (cap 3 each).
+# Preserves departed-member cleanup and active roster synchronization.
 import os
 import re
 import json
@@ -247,6 +247,13 @@ CHARACTER_RACE_ROLE_IDS = {
     "Majin": 1543930112037232730,
     "Bio-Android": 1543930297257693326,
     "Tuffle": 1544872038534226021,
+
+    # v8.0 — New playable races.
+    # Grey Race and Demon Race currently share the same Discord role ID as
+    # provided by Staff. Their Character Applications remain the source of
+    # truth that distinguishes which Race Count bucket they occupy.
+    "Grey Race": 1554845472072536144,
+    "Demon Race": 1554845472072536144,
 }
 
 # Cache used for Discord access restoration.
@@ -291,6 +298,8 @@ RACE_COUNT_LIMITS = {
     "Bio-Android": ("Bio-Android", 10),
     "Majin": ("Majin", 10),
     "Tuffle": ("Tuffle", 5),
+    "Grey Race": ("Grey Race", 3),
+    "Demon Race": ("Demon Race", 3),
 }
 
 # Legacy-only: retained for historical parsing helpers. v7.0 no longer
@@ -447,6 +456,28 @@ RACE_MAPPING = {
     "tsufru": "Tuffle",
     "tsufruian": "Tuffle",
     "tsufurian": "Tuffle",
+
+    # Grey Race / Jiren's race
+    "grey race": "Grey Race",
+    "gray race": "Grey Race",
+    "grey": "Grey Race",
+    "gray": "Grey Race",
+    "jiren race": "Grey Race",
+    "jiren's race": "Grey Race",
+    "jirens race": "Grey Race",
+    "jiren species": "Grey Race",
+    "grey alien": "Grey Race",
+    "gray alien": "Grey Race",
+
+    # Demon Race
+    "demon race": "Demon Race",
+    "demon": "Demon Race",
+    "demons": "Demon Race",
+    "demon clan": "Demon Race",
+    "demon realm race": "Demon Race",
+    "demon realm": "Demon Race",
+    "demonic race": "Demon Race",
+    "demonic": "Demon Race",
 }
 
 
@@ -4591,6 +4622,16 @@ def detect_race_tag(
     if re.match(r"^bio\s+androids?\b", leading_words):
         return "Bio-Android"
 
+    # v8.0 — New races. Check common explicit forms before generic alias
+    # matching so punctuation/possessives are handled consistently.
+    if re.match(r"^(?:grey|gray)(?:\s+race|\s+alien)?\b", leading_words):
+        return "Grey Race"
+    if re.match(r"^jiren(?:s)?(?:\s+race|\s+species)?\b", leading_words):
+        return "Grey Race"
+
+    if re.match(r"^demon(?:s|ic)?(?:\s+race|\s+clan|\s+realm(?:\s+race)?)?\b", leading_words):
+        return "Demon Race"
+
     # 1) Exact match or explicit race at the beginning of the field. Longest
     # aliases are checked first so compound races win over generic aliases.
     prefix_matches = []
@@ -5155,8 +5196,9 @@ async def on_ready():
         print("🤖 Human/Android race disambiguation enabled (v7.5).")
         print("🟠 Saiyan race cap set to 11 (v7.5).")
         print("🧠 Robust compact-field race parsing enabled (v7.5).")
-        print("🎓 Active Mentor roster reconciliation enabled (v7.9).")
-        print("🧹 Departed-member publication cleanup enabled (v7.9).")
+        print("🎓 Active Mentor roster reconciliation enabled (v8.0).")
+        print("🧹 Departed-member publication cleanup enabled (v8.0).")
+        print("👽 Grey Race + 😈 Demon Race support enabled (v8.0, cap 3 each).")
         await sync_all_community_access()
         INITIAL_ACCESS_SYNC_DONE = True
         print()
@@ -7032,6 +7074,8 @@ async def handle_character_application(
                 "`Race: Bio-Android`\n"
                 "`Race: Majin`\n"
                 "`Race: Tuffle`\n"
+                "`Race: Grey Race`\n"
+                "`Race: Demon Race`\n"
                 "Mutants can use formats such as "
                 "`Race: Mutant Saiyan` or `Mutant: Yes`.\n\n"
                 "The application was **not "
