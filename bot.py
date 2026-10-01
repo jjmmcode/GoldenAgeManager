@@ -292,7 +292,7 @@ RACE_COUNT_CHANNEL_ID = 1543938120301551626
 RACE_COUNT_LIMITS = {
     "Saiyan": ("Saiyan", 11),
     "Human": ("Human", 10),
-    "Android": ("Human (Android)", 2),
+    "Android": ("Human (Android)", 3),
     "Namekian": ("Namekian", 10),
     "Frost-Demon": ("Arcosian", 10),
     "Bio-Android": ("Bio-Android", 10),
