@@ -1,6 +1,6 @@
-# Golden Age Manager v8.0
-# Adds Grey Race and Demon Race character support (cap 3 each).
-# Preserves departed-member cleanup and active roster synchronization.
+# Golden Age Manager v8.1
+# Adds DragonMineZ 2.2 techniques to the Mentor Ability catalogue.
+# Preserves Grey/Demon races, departed-member cleanup and active roster synchronization.
 import os
 import re
 import json
@@ -77,6 +77,7 @@ AVAILABLE_ABILITIES_LOCK = asyncio.Lock()
 # availability from already-approved Mentor Applications.
 MENTOR_ABILITY_CATALOG = {
     "Technique": [
+        # Existing Golden Age mentor catalogue
         "Big Bang",
         "Burning Attack",
         # Death Beam + Emperor Death Beam share ONE mentor slot.
@@ -98,6 +99,39 @@ MENTOR_ABILITY_CATALOG = {
         "Spirit Bomb",
         "Supernova",
         "Supernova Cooler",
+
+        # DragonMineZ 2.2 — new Ki techniques
+        "Heat Dome Attack",
+        "Hellzone Grenade",
+        "Dodon Ray",
+        "Tri-Beam",
+        "Neo Tri-Beam",
+        "Assault Rain",
+        "Blaster Meteor",
+        "Mouth Blast",
+        "Kill Driver",
+
+        # DragonMineZ 2.2 — new Strike techniques
+        "Spirit Breaking Cannon",
+        "Shining Sword Attack",
+        "Oozaru Slam",
+        "Gum Punch",
+        "Blue Hurricane",
+        "Grab Throw",
+        "Meteor Combo",
+        "Meteor Burst",
+        "Mystic Ball Attack",
+        "Dimensional Fist",
+        "Dimensional Slash",
+
+        # DragonMineZ 2.2 — Evasion techniques
+        # Solar Flare existed previously but moved into the new Evasion
+        # category in v2.2; it was not present in Golden Age's old whitelist.
+        "Afterimage",
+        "Solar Flare",
+        "Rage Scream",
+        "Sleep Recovery",
+        "Dimensional Warp",
     ],
     "Custom-Form": [],
     "Passive-Skill": [],
@@ -134,6 +168,60 @@ MENTOR_ABILITY_ALIASES = {
     "supernova": "Supernova",
     "supernova cooler": "Supernova Cooler",
     "cooler supernova": "Supernova Cooler",
+
+    # DragonMineZ 2.2 — Ki techniques
+    "heat dome attack": "Heat Dome Attack",
+    "heat dome": "Heat Dome Attack",
+    "hellzone grenade": "Hellzone Grenade",
+    "hell zone grenade": "Hellzone Grenade",
+    "dodon ray": "Dodon Ray",
+    "dodonpa": "Dodon Ray",
+    "dodon pa": "Dodon Ray",
+    "tri-beam": "Tri-Beam",
+    "tri beam": "Tri-Beam",
+    "tribeam": "Tri-Beam",
+    "kikoho": "Tri-Beam",
+    "neo tri-beam": "Neo Tri-Beam",
+    "neo tri beam": "Neo Tri-Beam",
+    "neo tribeam": "Neo Tri-Beam",
+    "neo kikoho": "Neo Tri-Beam",
+    "assault rain": "Assault Rain",
+    "blaster meteor": "Blaster Meteor",
+    "mouth blast": "Mouth Blast",
+    "kill driver": "Kill Driver",
+
+    # DragonMineZ 2.2 — Strike techniques
+    "spirit breaking cannon": "Spirit Breaking Cannon",
+    "spirit-breaking cannon": "Spirit Breaking Cannon",
+    "shining sword attack": "Shining Sword Attack",
+    "shining sword": "Shining Sword Attack",
+    "oozaru slam": "Oozaru Slam",
+    "great ape slam": "Oozaru Slam",
+    "gum punch": "Gum Punch",
+    "blue hurricane": "Blue Hurricane",
+    "grab throw": "Grab Throw",
+    "grab and throw": "Grab Throw",
+    "meteor combo": "Meteor Combo",
+    "meteor burst": "Meteor Burst",
+    "mystic ball attack": "Mystic Ball Attack",
+    "mystic ball": "Mystic Ball Attack",
+    "dimensional fist": "Dimensional Fist",
+    "dimension fist": "Dimensional Fist",
+    "dimensional slash": "Dimensional Slash",
+    "dimension slash": "Dimensional Slash",
+
+    # DragonMineZ 2.2 — Evasion techniques
+    "afterimage": "Afterimage",
+    "after image": "Afterimage",
+    "zanzoken": "Afterimage",
+    "solar flare": "Solar Flare",
+    "taiyoken": "Solar Flare",
+    "taiyo ken": "Solar Flare",
+    "rage scream": "Rage Scream",
+    "sleep recovery": "Sleep Recovery",
+    "regenerative sleep": "Sleep Recovery",
+    "dimensional warp": "Dimensional Warp",
+    "dimension warp": "Dimensional Warp",
 }
 
 
@@ -292,7 +380,7 @@ RACE_COUNT_CHANNEL_ID = 1543938120301551626
 RACE_COUNT_LIMITS = {
     "Saiyan": ("Saiyan", 11),
     "Human": ("Human", 10),
-    "Android": ("Human (Android)", 3),
+    "Android": ("Human (Android)", 2),
     "Namekian": ("Namekian", 10),
     "Frost-Demon": ("Arcosian", 10),
     "Bio-Android": ("Bio-Android", 10),
@@ -4141,6 +4229,7 @@ def build_available_abilities_message():
         "",
         "-# Kienzan + Kienzan Doble share one mentor slot; the same mentor must know both techniques.",
         "-# Death Beam + Emperor Death Beam share one mentor slot; the same mentor must know both techniques.",
+        "-# DragonMineZ 2.2 Ki, Strike and Evasion techniques are included in this catalogue.",
         "",
     ]
 
@@ -5196,9 +5285,10 @@ async def on_ready():
         print("🤖 Human/Android race disambiguation enabled (v7.5).")
         print("🟠 Saiyan race cap set to 11 (v7.5).")
         print("🧠 Robust compact-field race parsing enabled (v7.5).")
-        print("🎓 Active Mentor roster reconciliation enabled (v8.0).")
-        print("🧹 Departed-member publication cleanup enabled (v8.0).")
-        print("👽 Grey Race + 😈 Demon Race support enabled (v8.0, cap 3 each).")
+        print("🎓 Active Mentor roster reconciliation enabled (v8.1).")
+        print("🧹 Departed-member publication cleanup enabled (v8.1).")
+        print("👽 Grey Race + 😈 Demon Race support enabled (v8.1, cap 3 each).")
+        print("🥋 DragonMineZ 2.2 Mentor Technique catalogue enabled (v8.1).")
         await sync_all_community_access()
         INITIAL_ACCESS_SYNC_DONE = True
         print()
