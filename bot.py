@@ -378,7 +378,7 @@ RACE_COUNT_CHANNEL_ID = 1543938120301551626
 # current Discord roster and matching race roles. Departed players or stale
 # race roles no longer consume public race slots.
 RACE_COUNT_LIMITS = {
-    "Saiyan": ("Saiyan", 11),
+    "Saiyan": ("Saiyan", 10),
     "Human": ("Human", 10),
     "Android": ("Human (Android)", 2),
     "Namekian": ("Namekian", 10),
