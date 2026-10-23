@@ -387,7 +387,7 @@ RACE_COUNT_LIMITS = {
     "Majin": ("Majin", 10),
     "Tuffle": ("Tuffle", 5),
     "Grey Race": ("Grey Race", 3),
-    "Demon Race": ("Demon Race", 3),
+    "Glind": ("Glind", 10),
 }
 
 # Legacy-only: retained for historical parsing helpers. v7.0 no longer
