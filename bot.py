@@ -1,6 +1,6 @@
-# Golden Age Manager v8.1
-# Adds DragonMineZ 2.2 techniques to the Mentor Ability catalogue.
-# Preserves Grey/Demon races, departed-member cleanup and active roster synchronization.
+# Golden Age Manager v8.2
+# Renames Demon Race to Glind across the character/race systems.
+# Preserves legacy Demon aliases, DMZ 2.2 techniques and existing automation.
 import os
 import re
 import json
@@ -336,12 +336,12 @@ CHARACTER_RACE_ROLE_IDS = {
     "Bio-Android": 1543930297257693326,
     "Tuffle": 1544872038534226021,
 
-    # v8.0 — New playable races.
-    # Grey Race and Demon Race currently share the same Discord role ID as
-    # provided by Staff. Their Character Applications remain the source of
+    # New playable races.
+    # Grey Race and Glind currently share the same Discord role ID as
+    # configured by Staff. Their Character Applications remain the source of
     # truth that distinguishes which Race Count bucket they occupy.
     "Grey Race": 1554845472072536144,
-    "Demon Race": 1554845472072536144,
+    "Glind": 1554845472072536144,
 }
 
 # Cache used for Discord access restoration.
@@ -386,6 +386,7 @@ RACE_COUNT_LIMITS = {
     "Bio-Android": ("Bio-Android", 10),
     "Majin": ("Majin", 10),
     "Tuffle": ("Tuffle", 5),
+    "Konatsians": ("Konatsians", 5),
     "Grey Race": ("Grey Race", 3),
     "Glind": ("Glind", 10),
 }
@@ -557,15 +558,22 @@ RACE_MAPPING = {
     "grey alien": "Grey Race",
     "gray alien": "Grey Race",
 
-    # Demon Race
-    "demon race": "Demon Race",
-    "demon": "Demon Race",
-    "demons": "Demon Race",
-    "demon clan": "Demon Race",
-    "demon realm race": "Demon Race",
-    "demon realm": "Demon Race",
-    "demonic race": "Demon Race",
-    "demonic": "Demon Race",
+    # Glind
+    # "Demon" variants are retained as backwards-compatible aliases so old
+    # Character Applications continue resolving correctly after the rename.
+    "glind": "Glind",
+    "glinds": "Glind",
+    "glind race": "Glind",
+    "glindian": "Glind",
+    "glindian race": "Glind",
+    "demon race": "Glind",
+    "demon": "Glind",
+    "demons": "Glind",
+    "demon clan": "Glind",
+    "demon realm race": "Glind",
+    "demon realm": "Glind",
+    "demonic race": "Glind",
+    "demonic": "Glind",
 }
 
 
@@ -4718,8 +4726,12 @@ def detect_race_tag(
     if re.match(r"^jiren(?:s)?(?:\s+race|\s+species)?\b", leading_words):
         return "Grey Race"
 
+    # Glind is the canonical name. Legacy Demon/Demon Race wording is still
+    # accepted because older applications may use the previous terminology.
+    if re.match(r"^(?:glinds?|glindian)(?:\s+race)?\b", leading_words):
+        return "Glind"
     if re.match(r"^demon(?:s|ic)?(?:\s+race|\s+clan|\s+realm(?:\s+race)?)?\b", leading_words):
-        return "Demon Race"
+        return "Glind"
 
     # 1) Exact match or explicit race at the beginning of the field. Longest
     # aliases are checked first so compound races win over generic aliases.
@@ -5285,10 +5297,10 @@ async def on_ready():
         print("🤖 Human/Android race disambiguation enabled (v7.5).")
         print("🟠 Saiyan race cap set to 11 (v7.5).")
         print("🧠 Robust compact-field race parsing enabled (v7.5).")
-        print("🎓 Active Mentor roster reconciliation enabled (v8.1).")
-        print("🧹 Departed-member publication cleanup enabled (v8.1).")
-        print("👽 Grey Race + 😈 Demon Race support enabled (v8.1, cap 3 each).")
-        print("🥋 DragonMineZ 2.2 Mentor Technique catalogue enabled (v8.1).")
+        print("🎓 Active Mentor roster reconciliation enabled (v8.2).")
+        print("🧹 Departed-member publication cleanup enabled (v8.2).")
+        print("👽 Grey Race + 🔥 Glind support enabled (v8.2).")
+        print("🥋 DragonMineZ 2.2 Mentor Technique catalogue enabled (v8.2).")
         await sync_all_community_access()
         INITIAL_ACCESS_SYNC_DONE = True
         print()
@@ -7165,7 +7177,7 @@ async def handle_character_application(
                 "`Race: Majin`\n"
                 "`Race: Tuffle`\n"
                 "`Race: Grey Race`\n"
-                "`Race: Demon Race`\n"
+                "`Race: Glind`\n"
                 "Mutants can use formats such as "
                 "`Race: Mutant Saiyan` or `Mutant: Yes`.\n\n"
                 "The application was **not "
